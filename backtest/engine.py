@@ -102,6 +102,32 @@ def _apply_turnover_cap(
     return capped
 
 
+def _apply_position_weight_cap(
+    target_weights: pd.Series,
+    max_position_weight: float | None,
+) -> pd.Series:
+    """Cap individual asset weights and leave any remainder in cash."""
+    if max_position_weight is None:
+        return target_weights
+    return target_weights.clip(lower=0.0, upper=max_position_weight)
+
+
+def _apply_gross_exposure_cap(
+    target_weights: pd.Series,
+    max_gross_exposure: float | None,
+) -> pd.Series:
+    """Scale the full portfolio down to a maximum gross exposure."""
+    if max_gross_exposure is None:
+        return target_weights
+
+    total_weight = float(target_weights.sum())
+    if total_weight <= 0 or total_weight <= max_gross_exposure:
+        return target_weights
+
+    scale = max_gross_exposure / total_weight
+    return target_weights * scale
+
+
 def run_momentum_rotation_backtest(
     ohlcv: pd.DataFrame,
     top_n: int,
@@ -112,6 +138,9 @@ def run_momentum_rotation_backtest(
     medium_weight: float = 0.5,
     btc_symbol: str = "BTC/USD",
     regime_ma_lookback_bars: int = 30,
+    use_regime_filter: bool = True,
+    max_position_weight: float | None = None,
+    max_gross_exposure: float | None = None,
     transaction_cost_bps: float = 10.0,
     slippage_bps: float = 0.0,
     initial_capital: float = 10_000.0,
@@ -121,6 +150,13 @@ def run_momentum_rotation_backtest(
     max_turnover_per_rebalance: float | None = None,
 ) -> BacktestResult:
     """Backtest long-only momentum rotation with periodic rebalancing and BTC regime filter."""
+    from config import SETTINGS
+
+    if max_position_weight is None:
+        max_position_weight = SETTINGS.max_position_weight
+    if max_gross_exposure is None:
+        max_gross_exposure = SETTINGS.max_gross_exposure
+
     if top_n <= 0:
         raise ValueError("top_n must be positive")
     if rebalance_every_bars <= 0:
@@ -137,6 +173,10 @@ def run_momentum_rotation_backtest(
         raise ValueError("min_median_volume must be non-negative when provided")
     if max_turnover_per_rebalance is not None and max_turnover_per_rebalance <= 0:
         raise ValueError("max_turnover_per_rebalance must be positive when provided")
+    if max_position_weight is not None and (max_position_weight <= 0 or max_position_weight > 1.0):
+        raise ValueError("max_position_weight must be within (0, 1] when provided")
+    if max_gross_exposure is not None and (max_gross_exposure <= 0 or max_gross_exposure > 1.0):
+        raise ValueError("max_gross_exposure must be within (0, 1] when provided")
 
     if min_history_bars is None:
         min_history_bars = max(short_lookback_bars, medium_lookback_bars)
@@ -164,7 +204,11 @@ def run_momentum_rotation_backtest(
         medium_weight=medium_weight,
     )
 
-    start_bar = max(short_lookback_bars, medium_lookback_bars, regime_ma_lookback_bars)
+    start_bar = max(
+        short_lookback_bars,
+        medium_lookback_bars,
+        regime_ma_lookback_bars if use_regime_filter else 0,
+    )
     if start_bar >= len(close.index) - 1:
         raise ValueError("Not enough rows for configured lookbacks")
 
@@ -230,12 +274,16 @@ def run_momentum_rotation_backtest(
             pending_eligible_count = 0
 
         if is_rebalance:
-            risk_on = check_regime_filter(
-                close=close,
-                rebalance_timestamp=ts,
-                btc_symbol=btc_symbol,
-                ma_lookback_bars=regime_ma_lookback_bars,
-            )
+            # The BTC filter is optional because robustness tests showed it can
+            # be a useful research overlay but a weak default risk-control rule.
+            risk_on = True
+            if use_regime_filter:
+                risk_on = check_regime_filter(
+                    close=close,
+                    rebalance_timestamp=ts,
+                    btc_symbol=btc_symbol,
+                    ma_lookback_bars=regime_ma_lookback_bars,
+                )
 
             target_weights = pd.Series(0.0, index=symbols, dtype=float)
             selected: list[str] = []
@@ -253,6 +301,17 @@ def run_momentum_rotation_backtest(
                 )
                 selected = [sym for sym in ranked if sym in set(eligible_symbols)][:top_n]
                 target_weights = _build_target_weights(symbols, selected)
+
+                # This cap is a simple cash overlay only; it does not alter
+                # ranking or selection, only the maximum exposure per asset.
+                target_weights = _apply_position_weight_cap(
+                    target_weights=target_weights,
+                    max_position_weight=max_position_weight,
+                )
+                target_weights = _apply_gross_exposure_cap(
+                    target_weights=target_weights,
+                    max_gross_exposure=max_gross_exposure,
+                )
 
             target_weights = _apply_turnover_cap(
                 current_weights=current_weights,
