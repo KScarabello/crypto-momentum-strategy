@@ -54,6 +54,9 @@ def rank_symbols_for_date(
         raise KeyError(f"rebalance_timestamp not found in score index: {rebalance_timestamp}")
 
     row = momentum_score.loc[rebalance_timestamp]
+    # Handle case where .loc[] returns DataFrame instead of Series
+    if isinstance(row, pd.DataFrame):
+        row = row.iloc[0]
     ranked = row.dropna().sort_values(ascending=False)
     return ranked.head(top_n).index.tolist()
 

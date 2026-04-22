@@ -20,3 +20,9 @@ data/local/
 outputs/
 outputs_*/
 *.log
+
+# Signal state (pending signals from one-bar-delayed execution)
+.signals/
+
+# Secrets
+.env
