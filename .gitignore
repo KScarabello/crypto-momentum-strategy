@@ -18,4 +18,5 @@ env/
 # Local data and outputs
 data/local/
 outputs/
+outputs_*/
 *.log
