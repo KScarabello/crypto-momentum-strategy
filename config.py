@@ -10,7 +10,7 @@ from pathlib import Path
 class Settings:
     """Configuration values for a single momentum rotation backtest."""
 
-    symbols: tuple[str, ...] = ("BTC/USD", "ETH/USD", "SOL/USD", "AVAX/USD", "XRP/USD")
+    symbols: tuple[str, ...] = ("BTC/USD", "ETH/USD", "XRP/USD")
     timeframe: str = "4h"
 
     top_n: int = 3
@@ -19,12 +19,27 @@ class Settings:
     short_weight: float = 0.5
     medium_weight: float = 0.5
 
+    # LOCKED BASELINE CONFIGURATION
+    # This configuration represents the validated baseline after robustness testing.
+    # New experiments should be created in separate files, not by modifying these values.
+    #
+    # Strategy: Pure cross-sectional momentum (no regime filter)
+    # Robustness testing showed the BTC regime filter can degrade modern-period
+    # performance, so we use only dual-lookback momentum ranking.
+    use_regime_filter: bool = False
+    # Optional per-position cap that leaves residual weight in cash rather than
+    # concentrating the portfolio into a single winner. Currently kept for future use.
+    max_position_weight: float | None = 0.5
+    # VALIDATED OVERLAY: Optional total exposure cap scales the whole portfolio down
+    # and leaves the remainder in cash. Testing showed this effectively reduces
+    # max drawdown while maintaining Sharpe ratio. This is the locked baseline value.
+    max_gross_exposure: float | None = 0.75
     btc_symbol: str = "BTC/USD"
-    regime_lookback_bars: int = 180
+    regime_lookback_bars: int = 60
     rebalance_every_bars: int = 6
 
-    transaction_cost_bps: float = 10.0
-    slippage_bps: float = 2.0
+    transaction_cost_bps: float = 30.0
+    slippage_bps: float = 15.0
     initial_capital: float = 10_000.0
     min_history_bars: int | None = 180
     min_eligible_assets: int = 2

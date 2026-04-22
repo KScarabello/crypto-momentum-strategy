@@ -1,4 +1,12 @@
-"""Run the end-to-end momentum rotation research backtest."""
+"""Run the locked baseline momentum rotation research backtest.
+
+This script reflects the validated baseline strategy configuration after robustness testing:
+- Pure cross-sectional momentum (no BTC regime filter)
+- Gross exposure cap of 75% (effective risk control overlay)
+- No volatility targeting
+
+New experiments should be created in separate files rather than modifying this baseline.
+"""
 
 from __future__ import annotations
 
@@ -140,6 +148,7 @@ def main() -> None:
         medium_weight=SETTINGS.medium_weight,
         btc_symbol=SETTINGS.btc_symbol,
         regime_ma_lookback_bars=SETTINGS.regime_lookback_bars,
+        use_regime_filter=SETTINGS.use_regime_filter,
         transaction_cost_bps=SETTINGS.transaction_cost_bps,
         slippage_bps=SETTINGS.slippage_bps,
         initial_capital=SETTINGS.initial_capital,
@@ -160,8 +169,91 @@ def main() -> None:
         bars_per_year=bars_per_year,
     )
 
+    btc_close = (
+        ohlcv.loc[ohlcv["symbol"] == SETTINGS.btc_symbol, ["timestamp", "close"]]
+        .dropna(subset=["timestamp", "close"])
+        .sort_values("timestamp")
+        .drop_duplicates(subset=["timestamp"], keep="last")
+        .set_index("timestamp")["close"]
+        .astype(float)
+    )
+    if btc_close.empty:
+        raise ValueError(f"No OHLCV rows found for BTC benchmark symbol: {SETTINGS.btc_symbol}")
+
+    btc_returns = btc_close.pct_change().fillna(0.0)
+    btc_equity = SETTINGS.initial_capital * (1.0 + btc_returns).cumprod()
+
+    btc_equity = btc_equity.reindex(result.portfolio.index).ffill().dropna()
+    btc_returns = btc_returns.reindex(btc_equity.index).fillna(0.0)
+
+    btc_metrics = summary_metrics(
+        equity=btc_equity,
+        returns=btc_returns,
+        bars_per_year=bars_per_year,
+    )
+
+    split_ts = "2020-01-01"
+    ohlcv_early = ohlcv.loc[ohlcv["timestamp"] < split_ts].copy()
+    ohlcv_recent = ohlcv.loc[ohlcv["timestamp"] >= split_ts].copy()
+
+    period_runs = [
+        ("Early Period (pre-2020)", ohlcv_early),
+        ("Recent Period (2020+)", ohlcv_recent),
+    ]
+
+    period_results: list[tuple[str, dict[str, float] | None, str | None]] = []
+    for label, period_ohlcv in period_runs:
+        if period_ohlcv.empty:
+            period_results.append((label, None, "no rows in this period"))
+            continue
+
+        try:
+            period_result = run_momentum_rotation_backtest(
+                ohlcv=period_ohlcv,
+                top_n=SETTINGS.top_n,
+                rebalance_every_bars=SETTINGS.rebalance_every_bars,
+                short_lookback_bars=SETTINGS.short_lookback_bars,
+                medium_lookback_bars=SETTINGS.medium_lookback_bars,
+                short_weight=SETTINGS.short_weight,
+                medium_weight=SETTINGS.medium_weight,
+                btc_symbol=SETTINGS.btc_symbol,
+                regime_ma_lookback_bars=SETTINGS.regime_lookback_bars,
+                use_regime_filter=SETTINGS.use_regime_filter,
+                transaction_cost_bps=SETTINGS.transaction_cost_bps,
+                slippage_bps=SETTINGS.slippage_bps,
+                initial_capital=SETTINGS.initial_capital,
+                min_history_bars=SETTINGS.min_history_bars,
+                min_eligible_assets=SETTINGS.min_eligible_assets,
+                min_median_volume=SETTINGS.min_median_volume,
+                max_turnover_per_rebalance=SETTINGS.max_turnover_per_rebalance,
+            )
+
+            period_metrics = summary_metrics(
+                equity=period_result.portfolio["equity"],
+                returns=period_result.portfolio["strategy_return"],
+                turnover=period_result.turnover,
+                bars_per_year=bars_per_year,
+            )
+            period_results.append((label, period_metrics, None))
+        except Exception as exc:
+            period_results.append((label, None, str(exc)))
+
     paths = write_outputs(result=result, output_dir=SETTINGS.output_dir)
     print_summary(metrics)
+    print("\nBTC Buy & Hold")
+    print(f"- cagr: {btc_metrics['cagr']:.6f}")
+    print(f"- sharpe: {btc_metrics['sharpe']:.6f}")
+    print(f"- max_drawdown: {btc_metrics['max_drawdown']:.6f}")
+
+    for label, period_metrics, error in period_results:
+        print(f"\n{label}")
+        if period_metrics is None:
+            print(f"- skipped: {error}")
+            continue
+        print(f"- cagr: {period_metrics['cagr']:.6f}")
+        print(f"- sharpe: {period_metrics['sharpe']:.6f}")
+        print(f"- max_drawdown: {period_metrics['max_drawdown']:.6f}")
+
     print_sanity_summary(result=result, ohlcv=ohlcv)
 
     logger.info("Saved equity curve to %s", paths["equity"])
