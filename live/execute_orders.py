@@ -185,8 +185,8 @@ def _submit_kraken_orders_live(
     api_key: str,
     api_secret: str,
     api_passphrase: str | None,
-) -> list[dict[str, Any]]:
-    """Submit vetted orders to Kraken and return exchange responses.
+) -> dict[str, list[dict[str, Any]]]:
+    """Submit vetted orders to Kraken and collect per-order execution outcomes.
 
     NOTE: This is the actual live submission path.
     """
@@ -204,28 +204,34 @@ def _submit_kraken_orders_live(
         }
     )
 
-    # Use one ticker snapshot for deterministic notional->amount conversion.
+    # Use one ticker snapshot for deterministic notional->amount conversion when possible.
     symbols = sorted({o.symbol for o in orders})
+    tickers: dict[str, Any] = {}
     try:
         tickers = exchange.fetch_tickers(symbols)
     except Exception as exc:
-        raise RuntimeError(f"Failed to fetch Kraken tickers before submission: {exc}") from exc
+        logging.getLogger(__name__).warning(
+            "Failed to fetch Kraken tickers snapshot, falling back to per-symbol fetch: %s",
+            exc,
+        )
 
-    responses: list[dict[str, Any]] = []
+    results: dict[str, list[dict[str, Any]]] = {"successes": [], "failures": []}
     for order in orders:
-        ticker = tickers.get(order.symbol)
-        if not ticker:
-            raise RuntimeError(f"Missing ticker for order symbol: {order.symbol}")
-
-        price = ticker.get("last") or ticker.get("close")
-        if price is None or float(price) <= 0:
-            raise RuntimeError(f"Invalid market price for {order.symbol}: {price}")
-
-        amount = float(order.notional_usd) / float(price)
-        if amount <= 0:
-            raise RuntimeError(f"Computed non-positive base amount for {order.symbol}: {amount}")
-
         try:
+            ticker = tickers.get(order.symbol)
+            if not ticker:
+                ticker = exchange.fetch_ticker(order.symbol)
+            if not ticker:
+                raise RuntimeError(f"Missing ticker for order symbol: {order.symbol}")
+
+            price = ticker.get("last") or ticker.get("close")
+            if price is None or float(price) <= 0:
+                raise RuntimeError(f"Invalid market price for {order.symbol}: {price}")
+
+            amount = float(order.notional_usd) / float(price)
+            if amount <= 0:
+                raise RuntimeError(f"Computed non-positive base amount for {order.symbol}: {amount}")
+
             # LIVE SUBMISSION: market order to Kraken.
             response = exchange.create_order(
                 symbol=order.symbol,
@@ -233,12 +239,31 @@ def _submit_kraken_orders_live(
                 side=order.side,
                 amount=amount,
             )
+            results["successes"].append(
+                {
+                    "symbol": order.symbol,
+                    "side": order.side,
+                    "notional_usd": order.notional_usd,
+                    "amount": amount,
+                    "response": response,
+                }
+            )
         except Exception as exc:
-            raise RuntimeError(f"Kraken API error while submitting {order.symbol} {order.side}: {exc}") from exc
+            results["failures"].append(
+                {
+                    "symbol": order.symbol,
+                    "side": order.side,
+                    "notional_usd": order.notional_usd,
+                    "error": str(exc),
+                }
+            )
 
-        responses.append(response)
+    return results
 
-    return responses
+
+def _available_cash_usd(account_state: Any) -> float:
+    """Estimate available USD cash as equity minus risky position exposure."""
+    return max(0.0, float(account_state.equity) - float(sum(account_state.positions.values())))
 
 
 def main() -> None:
@@ -394,7 +419,7 @@ def main() -> None:
 
     if not args.live:
         logger.info("Dry-run mode: no orders submitted")
-        clear_pending_signal()  # Clear pending after dry-run
+        # Dry-run preview must not mutate pending signal state.
         return
 
     if not vetted_orders:
@@ -403,48 +428,177 @@ def main() -> None:
         return
 
     logger.warning("LIVE MODE ENABLED: submitting orders to Kraken")
+    sell_orders = [o for o in vetted_orders if o.side.lower() == "sell"]
+    buy_orders = [o for o in vetted_orders if o.side.lower() == "buy"]
 
+    logger.info("Execution plan: %d SELL order(s), %d BUY order(s)", len(sell_orders), len(buy_orders))
+
+    execution_results: dict[str, list[dict[str, Any]]] = {"successes": [], "failures": []}
     try:
-        responses = _submit_kraken_orders_live(
-            orders=vetted_orders,
-            api_key=api_key or "",
-            api_secret=api_secret or "",
+        # PHASE 1: Execute SELL orders first.
+        sell_results: dict[str, list[dict[str, Any]]] = {"successes": [], "failures": []}
+        if sell_orders:
+            sell_results = _submit_kraken_orders_live(
+                orders=sell_orders,
+                api_key=api_key or "",
+                api_secret=api_secret or "",
+                api_passphrase=api_passphrase,
+            )
+            for s in sell_results["successes"]:
+                s["phase"] = "sell"
+            for f in sell_results["failures"]:
+                f["phase"] = "sell"
+            logger.info(
+                "SELL phase complete: %d succeeded, %d failed",
+                len(sell_results["successes"]),
+                len(sell_results["failures"]),
+            )
+        else:
+            logger.info("SELL phase skipped: no sell orders")
+
+        execution_results["successes"].extend(sell_results["successes"])
+        execution_results["failures"].extend(sell_results["failures"])
+
+        # PHASE 2: Refresh broker state and compute real available cash after sells.
+        refreshed_state = load_account_state(
+            source=args.broker_source,
+            api_key=api_key,
+            api_secret=api_secret,
             api_passphrase=api_passphrase,
         )
-    except Exception as exc:
-        if args.notify_email:
-            _notify_trade_event(
-                strategy_variant=strategy_result["strategy_variant"],
-                timestamp=str(strategy_result["timestamp"]),
-                symbol="N/A",
-                side="SELL",
-                notional_usd=0.0,
-                status_text=f"execution aborted: {exc}",
-            )
-        # Abort cleanly on any API error.
-        raise SystemExit(f"Execution aborted due to API error: {exc}")
+        refreshed_equity = float(refreshed_state.equity)
+        available_cash = _available_cash_usd(refreshed_state)
+        logger.info(
+            "Post-sell account refresh: equity=$%.2f available_cash=$%.2f",
+            refreshed_equity,
+            available_cash,
+        )
 
-    print("Submitted orders:")
-    for i, response in enumerate(responses, 1):
-        order_id = response.get("id", "unknown")
-        symbol = response.get("symbol", "unknown")
-        side = response.get("side", "unknown")
-        amount = response.get("amount", "unknown")
-        status = response.get("status", "unknown")
-        print(f"  {i}. id={order_id} symbol={symbol} side={side} amount={amount} status={status}")
+        # PHASE 3: Scale BUY orders to real available cash and execute.
+        scaled_buy_orders: list[PreparedOrder] = []
+        if buy_orders:
+            total_buy_notional = float(sum(o.notional_usd for o in buy_orders))
+            scale = 1.0
+            if total_buy_notional > 0 and total_buy_notional > available_cash:
+                scale = max(0.0, available_cash / total_buy_notional)
+                logger.warning(
+                    "BUY scaling applied: requested=$%.2f available=$%.2f scale=%.4f",
+                    total_buy_notional,
+                    available_cash,
+                    scale,
+                )
+
+            for order in buy_orders:
+                scaled_notional = order.notional_usd * scale
+                if scaled_notional < args.min_order_notional:
+                    logger.info(
+                        "BUY order dropped after scaling below min notional: %s %.2f < %.2f",
+                        order.symbol,
+                        scaled_notional,
+                        args.min_order_notional,
+                    )
+                    continue
+                scaled_buy_orders.append(
+                    PreparedOrder(
+                        symbol=order.symbol,
+                        side=order.side,
+                        notional_usd=min(scaled_notional, args.max_order_notional),
+                    )
+                )
+
+            buy_results: dict[str, list[dict[str, Any]]] = {"successes": [], "failures": []}
+            if scaled_buy_orders:
+                buy_results = _submit_kraken_orders_live(
+                    orders=scaled_buy_orders,
+                    api_key=api_key or "",
+                    api_secret=api_secret or "",
+                    api_passphrase=api_passphrase,
+                )
+                for s in buy_results["successes"]:
+                    s["phase"] = "buy"
+                for f in buy_results["failures"]:
+                    f["phase"] = "buy"
+                logger.info(
+                    "BUY phase complete: %d succeeded, %d failed",
+                    len(buy_results["successes"]),
+                    len(buy_results["failures"]),
+                )
+            else:
+                logger.info("BUY phase skipped: no buy orders after scaling and min-notional filter")
+
+            execution_results["successes"].extend(buy_results["successes"])
+            execution_results["failures"].extend(buy_results["failures"])
+        else:
+            logger.info("BUY phase skipped: no buy orders")
+    finally:
+        # Always clear pending after any live execution attempt to avoid stale retries.
+        clear_pending_signal()
+
+    successes = execution_results["successes"]
+    failures = execution_results["failures"]
+
+    if successes:
+        print("Submitted orders:")
+        for i, success in enumerate(successes, 1):
+            response = success.get("response", {})
+            order_id = response.get("id", "unknown")
+            symbol = response.get("symbol", success.get("symbol", "unknown"))
+            side = response.get("side", success.get("side", "unknown"))
+            amount = response.get("amount", success.get("amount", "unknown"))
+            status = response.get("status", "unknown")
+            phase = success.get("phase", "unknown")
+            print(f"  {i}. phase={phase} id={order_id} symbol={symbol} side={side} amount={amount} status={status}")
+
+    if failures:
+        print("Failed orders:")
+        for i, failure in enumerate(failures, 1):
+            phase = failure.get("phase", "unknown")
+            print(
+                f"  {i}. phase={phase} symbol={failure['symbol']} side={failure['side']} "
+                f"notional=${failure['notional_usd']:.2f} error={failure['error']}"
+            )
 
     if args.notify_email:
-        for order in vetted_orders:
+        for success in successes:
             _notify_trade_event(
                 strategy_variant=strategy_result["strategy_variant"],
                 timestamp=str(strategy_result["timestamp"]),
-                symbol=order.symbol,
-                side=order.side,
-                notional_usd=order.notional_usd,
-                status_text="submitted",
+                symbol=success["symbol"],
+                side=success["side"],
+                notional_usd=success["notional_usd"],
+                status_text=f"submitted ({success.get('phase', 'unknown')} phase)",
+            )
+        for failure in failures:
+            _notify_trade_event(
+                strategy_variant=strategy_result["strategy_variant"],
+                timestamp=str(strategy_result["timestamp"]),
+                symbol=failure["symbol"],
+                side=failure["side"],
+                notional_usd=failure["notional_usd"],
+                status_text=f"failed ({failure.get('phase', 'unknown')} phase): {failure['error']}",
             )
 
-    clear_pending_signal()  # Clear pending after successful execution
+    if failures and successes:
+        logger.error(
+            "PARTIAL EXECUTION: %d succeeded, %d failed. Pending signal cleared.",
+            len(successes),
+            len(failures),
+        )
+        raise SystemExit(
+            f"Partial execution: {len(successes)} succeeded, {len(failures)} failed. "
+            "Pending signal was cleared."
+        )
+
+    if failures and not successes:
+        logger.error(
+            "ALL ORDERS FAILED: %d failed. Pending signal cleared.",
+            len(failures),
+        )
+        raise SystemExit(
+            f"All orders failed ({len(failures)}). Pending signal was cleared."
+        )
+
+    logger.info("ALL ORDERS SUCCEEDED: %d submitted. Pending signal cleared.", len(successes))
 
 
 if __name__ == "__main__":
