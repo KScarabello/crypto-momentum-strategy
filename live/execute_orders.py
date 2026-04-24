@@ -261,11 +261,6 @@ def _submit_kraken_orders_live(
     return results
 
 
-def _available_cash_usd(account_state: Any) -> float:
-    """Estimate available USD cash as equity minus risky position exposure."""
-    return max(0.0, float(account_state.equity) - float(sum(account_state.positions.values())))
-
-
 def main() -> None:
     """Execute prepared orders with one-bar-delayed timing to match backtest.
     
@@ -466,7 +461,8 @@ def main() -> None:
             api_passphrase=api_passphrase,
         )
         refreshed_equity = float(refreshed_state.equity)
-        available_cash = _available_cash_usd(refreshed_state)
+        available_cash = max(0.0, float(getattr(refreshed_state, "available_cash", 0.0)))
+        logger.info("[EXECUTION] Using real available cash from broker: $%.2f", available_cash)
         logger.info(
             "[EXECUTION] Post-sell refresh: equity=$%.2f, available_cash=$%.2f",
             refreshed_equity,

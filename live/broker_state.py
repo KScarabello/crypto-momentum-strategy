@@ -36,6 +36,7 @@ class AccountState:
 
     equity: float  # total account equity in USD
     positions: dict[str, float]  # symbol -> dollar exposure
+    available_cash: float = 0.0  # broker-reported free USD cash
 
 
 def normalize_symbol(symbol: str, target_format: str = "BASE/QUOTE") -> str:
@@ -103,7 +104,8 @@ def load_account_state_mock(
     if total_risky > equity:
         raise ValueError(f"Preset positions (${total_risky}) exceed equity (${equity})")
 
-    return AccountState(equity=equity, positions=positions)
+    available_cash = max(0.0, float(equity) - float(total_risky))
+    return AccountState(equity=equity, positions=positions, available_cash=available_cash)
 
 
 def load_account_state_kraken(
@@ -170,6 +172,7 @@ def load_account_state_kraken(
         kraken=kraken,
         total_balances=total,
     )
+    available_cash = _extract_kraken_available_cash_usd(balances)
 
     # Total account equity = USD cash + market value of supported crypto holdings.
     equity_usd = usd_cash + float(sum(positions.values()))
@@ -178,7 +181,30 @@ def load_account_state_kraken(
             f"Invalid Kraken equity computed from cash+positions: cash={usd_cash}, positions={sum(positions.values())}"
         )
 
-    return AccountState(equity=equity_usd, positions=positions)
+    return AccountState(
+        equity=equity_usd,
+        positions=positions,
+        available_cash=available_cash,
+    )
+
+
+def _extract_kraken_available_cash_usd(balances: dict[str, object]) -> float:
+    """Extract broker-reported free USD cash from Kraken balance payload."""
+    free_balances = balances.get("free", {})
+    if not isinstance(free_balances, dict):
+        return 0.0
+
+    # Kraken may expose USD as USD or ZUSD depending on endpoint/account mapping.
+    for key in ("USD", "ZUSD"):
+        value = free_balances.get(key)
+        if value is None:
+            continue
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            continue
+
+    return 0.0
 
 
 def _normalize_kraken_holdings(kraken, total_balances: dict[str, float]) -> dict[str, float]:
