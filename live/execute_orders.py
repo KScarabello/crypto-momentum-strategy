@@ -321,12 +321,7 @@ def main() -> None:
     current_bar = generate_targets()
 
     if not current_bar.get("is_rebalance_bar", True):
-        print(
-            f"\nNon-rebalance bar: {current_bar['timestamp']} "
-            f"is not a scheduled rebalance bar "
-            f"(cadence: every {SETTINGS.rebalance_every_bars} × {SETTINGS.timeframe} bars = "
-            f"{SETTINGS.rebalance_every_bars * 4}h). Exiting safely."
-        )
+        logger.info("[SKIP] Non-rebalance bar: %s. No action taken.", current_bar["timestamp"])
         return
 
     if not current_bar.get("data_fresh", True):
@@ -356,7 +351,7 @@ def main() -> None:
             )
             return
 
-        logger.info(f"Executing pending signal from bar {pending_signal['timestamp']}")
+        logger.info("[EXECUTION] Executing pending signal from %s", pending_signal["timestamp"])
 
         # Use the pending signal for execution (not current bar).
         strategy_result, account_state, prepared_orders = _build_prepared_orders(
@@ -370,7 +365,10 @@ def main() -> None:
     else:
         # No pending signal. This is the decision bar (phase 1 of delay).
         # Generate signal, save as pending, and exit.
-        logger.info(f"Saving pending signal from decision bar {current_bar['timestamp']}")
+        logger.info(
+            "[DECISION] Signal generated at %s. Saved for next bar execution.",
+            current_bar["timestamp"],
+        )
         save_pending_signal(current_bar)
 
         print(
@@ -438,6 +436,7 @@ def main() -> None:
         # PHASE 1: Execute SELL orders first.
         sell_results: dict[str, list[dict[str, Any]]] = {"successes": [], "failures": []}
         if sell_orders:
+            logger.info("[SELL] Executing %d sell orders", len(sell_orders))
             sell_results = _submit_kraken_orders_live(
                 orders=sell_orders,
                 api_key=api_key or "",
@@ -469,7 +468,7 @@ def main() -> None:
         refreshed_equity = float(refreshed_state.equity)
         available_cash = _available_cash_usd(refreshed_state)
         logger.info(
-            "Post-sell account refresh: equity=$%.2f available_cash=$%.2f",
+            "[EXECUTION] Post-sell refresh: equity=$%.2f, available_cash=$%.2f",
             refreshed_equity,
             available_cash,
         )
@@ -477,12 +476,13 @@ def main() -> None:
         # PHASE 3: Scale BUY orders to real available cash and execute.
         scaled_buy_orders: list[PreparedOrder] = []
         if buy_orders:
+            logger.info("[BUY] Executing %d buy orders", len(buy_orders))
             total_buy_notional = float(sum(o.notional_usd for o in buy_orders))
             scale = 1.0
             if total_buy_notional > 0 and total_buy_notional > available_cash:
                 scale = max(0.0, available_cash / total_buy_notional)
                 logger.warning(
-                    "BUY scaling applied: requested=$%.2f available=$%.2f scale=%.4f",
+                    "[BUY] Scaling applied: requested=$%.2f, available=$%.2f, scale=%.4f",
                     total_buy_notional,
                     available_cash,
                     scale,
