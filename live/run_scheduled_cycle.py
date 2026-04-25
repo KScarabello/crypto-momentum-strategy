@@ -178,8 +178,8 @@ def main() -> None:
     parser.add_argument(
         "--max-order-notional",
         type=float,
-        default=25.0,
-        help="Maximum order notional in USD (exceeded orders are capped)",
+        default=None,
+        help="Optional maximum order notional in USD (exceeded orders are capped)",
     )
     args = parser.parse_args()
 
@@ -250,9 +250,13 @@ def main() -> None:
         args.broker_name,
         "--min-order-notional",
         str(args.min_order_notional),
-        "--max-order-notional",
-        str(args.max_order_notional),
     ]
+
+    if args.max_order_notional is not None:
+        cmd.extend([
+            "--max-order-notional",
+            str(args.max_order_notional),
+        ])
 
     if args.live:
         cmd.append("--live")

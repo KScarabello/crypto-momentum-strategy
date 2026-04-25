@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import time
 from typing import Any
 
 from dotenv import load_dotenv
@@ -24,6 +25,10 @@ from live.notify_email import send_trade_notification
 from live.plan_orders import plan_trades
 from live.prepare_orders import PreparedOrder, prepare_orders
 from live.signal_state import has_pending_signal, load_pending_signal, save_pending_signal, clear_pending_signal
+
+
+BUY_CASH_BUFFER_USD = 1.0
+SELL_SETTLEMENT_WAIT_SECONDS = 2.0
 
 
 def configure_logging() -> None:
@@ -100,21 +105,24 @@ def _apply_execution_safeguards(
     prepared_orders: list[PreparedOrder],
     supported_symbols: set[str],
     min_order_notional: float,
-    max_order_notional: float,
+    max_order_notional: float | None,
 ) -> list[PreparedOrder]:
     """Apply strict execution-time validation and filtering."""
     vetted: list[PreparedOrder] = []
+    logger = logging.getLogger(__name__)
 
     for order in prepared_orders:
         if order.symbol not in supported_symbols:
             raise ValueError(f"Unsupported symbol rejected: {order.symbol}")
         if order.notional_usd <= 0:
             raise ValueError(f"Non-positive notional rejected for {order.symbol}: {order.notional_usd}")
-        if order.notional_usd > max_order_notional:
-            print(
-                f"  WARNING: {order.symbol} {order.side.upper()} "
-                f"${order.notional_usd:,.2f} exceeds --max-order-notional "
-                f"${max_order_notional:,.2f} — capped to ${max_order_notional:,.2f}"
+        if max_order_notional is not None and order.notional_usd > max_order_notional:
+            logger.info(
+                "Order capped by max-order-notional: %s %s $%.2f -> $%.2f",
+                order.symbol,
+                order.side.upper(),
+                order.notional_usd,
+                max_order_notional,
             )
             order = PreparedOrder(
                 symbol=order.symbol,
@@ -180,6 +188,120 @@ def _notify_trade_event(
         logging.getLogger(__name__).warning("Email notification failed: %s", exc)
 
 
+def _format_order_notionals(orders: list[PreparedOrder]) -> str:
+    """Format a concise per-order notional summary for logs."""
+    if not orders:
+        return "none"
+    return ", ".join(f"{order.symbol}=${order.notional_usd:.2f}" for order in orders)
+
+
+def _plan_cash_aware_buy_orders(
+    buy_orders: list[PreparedOrder],
+    available_cash: float,
+    min_order_notional: float,
+    max_order_notional: float | None,
+    cash_buffer_usd: float = BUY_CASH_BUFFER_USD,
+) -> tuple[list[PreparedOrder], list[dict[str, Any]], dict[str, float]]:
+    """Resize and filter BUY orders so total spend stays within broker cash."""
+    requested_total = float(sum(order.notional_usd for order in buy_orders))
+    spendable_cash = max(0.0, float(available_cash) - float(cash_buffer_usd))
+    scale = min(1.0, spendable_cash / requested_total) if requested_total > 0 else 0.0
+
+    planned_orders: list[PreparedOrder] = []
+    skipped_orders: list[dict[str, Any]] = []
+    allocated_cash = 0.0
+
+    for order in buy_orders:
+        scaled_notional = float(order.notional_usd) * scale
+        if max_order_notional is not None:
+            scaled_notional = min(scaled_notional, float(max_order_notional))
+        remaining_cash = max(0.0, spendable_cash - allocated_cash)
+
+        if remaining_cash < min_order_notional:
+            skipped_orders.append(
+                {
+                    "symbol": order.symbol,
+                    "side": order.side,
+                    "notional_usd": order.notional_usd,
+                    "reason": (
+                        f"remaining spendable cash ${remaining_cash:.2f} is below min order "
+                        f"notional ${min_order_notional:.2f}"
+                    ),
+                }
+            )
+            continue
+
+        resized_notional = min(scaled_notional, remaining_cash)
+        if max_order_notional is not None:
+            resized_notional = min(resized_notional, float(max_order_notional))
+        if resized_notional < min_order_notional:
+            skipped_orders.append(
+                {
+                    "symbol": order.symbol,
+                    "side": order.side,
+                    "notional_usd": order.notional_usd,
+                    "reason": (
+                        f"resized notional ${resized_notional:.2f} is below min order "
+                        f"notional ${min_order_notional:.2f}"
+                    ),
+                }
+            )
+            continue
+
+        planned_orders.append(
+            PreparedOrder(
+                symbol=order.symbol,
+                side=order.side,
+                notional_usd=resized_notional,
+            )
+        )
+        allocated_cash += resized_notional
+
+    summary = {
+        "requested_total": requested_total,
+        "available_cash": max(0.0, float(available_cash)),
+        "spendable_cash": spendable_cash,
+        "scale": scale,
+        "allocated_cash": allocated_cash,
+        "cash_buffer_usd": float(cash_buffer_usd),
+    }
+    return planned_orders, skipped_orders, summary
+
+
+def _kraken_asset_balance_keys(base_asset: str) -> list[str]:
+    """Return likely Kraken balance keys for a base asset."""
+    normalized = base_asset.upper()
+    aliases = {
+        "BTC": ["BTC", "XBT", "XXBT"],
+        "ETH": ["ETH", "XETH"],
+        "XRP": ["XRP", "XXRP"],
+        "USD": ["USD", "ZUSD"],
+    }
+    keys = [normalized]
+    for alias in aliases.get(normalized, []):
+        if alias not in keys:
+            keys.append(alias)
+    return keys
+
+
+def _extract_free_asset_balance(balance_payload: dict[str, Any], base_asset: str) -> float:
+    """Extract free balance for a Kraken base asset with common symbol aliases."""
+    free_balances = balance_payload.get("free", {})
+    if not isinstance(free_balances, dict):
+        return 0.0
+
+    for key in _kraken_asset_balance_keys(base_asset):
+        value = free_balances.get(key)
+        if value is None:
+            continue
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            continue
+
+    return 0.0
+
+
 def _submit_kraken_orders_live(
     orders: list[PreparedOrder],
     api_key: str,
@@ -215,6 +337,15 @@ def _submit_kraken_orders_live(
             exc,
         )
 
+    balance_payload: dict[str, Any] = {}
+    try:
+        balance_payload = exchange.fetch_balance()
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "Failed to fetch Kraken free balances before order submission: %s",
+            exc,
+        )
+
     results: dict[str, list[dict[str, Any]]] = {"successes": [], "failures": []}
     for order in orders:
         try:
@@ -232,6 +363,26 @@ def _submit_kraken_orders_live(
             if amount <= 0:
                 raise RuntimeError(f"Computed non-positive base amount for {order.symbol}: {amount}")
 
+            effective_notional_usd = float(order.notional_usd)
+            if order.side.lower() == "sell":
+                base_asset = order.symbol.split("/")[0]
+                free_amount = _extract_free_asset_balance(balance_payload, base_asset)
+                if free_amount <= 0:
+                    raise RuntimeError(f"No free {base_asset} balance available for sell order")
+                if amount > free_amount:
+                    capped_amount = free_amount
+                    effective_notional_usd = float(capped_amount) * float(price)
+                    logging.getLogger(__name__).warning(
+                        "[SELL] Capping sell by available asset balance: %s requested=%.8f available=%.8f notional=$%.2f",
+                        order.symbol,
+                        amount,
+                        free_amount,
+                        effective_notional_usd,
+                    )
+                    amount = capped_amount
+                if effective_notional_usd <= 0:
+                    raise RuntimeError(f"Computed non-positive sell notional for {order.symbol}: {effective_notional_usd}")
+
             # LIVE SUBMISSION: market order to Kraken.
             response = exchange.create_order(
                 symbol=order.symbol,
@@ -243,7 +394,7 @@ def _submit_kraken_orders_live(
                 {
                     "symbol": order.symbol,
                     "side": order.side,
-                    "notional_usd": order.notional_usd,
+                    "notional_usd": effective_notional_usd,
                     "amount": amount,
                     "response": response,
                 }
@@ -282,15 +433,20 @@ def main() -> None:
         help="Send email notifications for preview/submission events",
     )
     parser.add_argument("--min-order-notional", type=float, default=10.0)
-    parser.add_argument("--max-order-notional", type=float, default=25.0)
+    parser.add_argument("--max-order-notional", type=float, default=None)
     args = parser.parse_args()
 
     if args.min_order_notional <= 0:
         raise SystemExit("--min-order-notional must be > 0")
-    if args.max_order_notional <= 0:
+    if args.max_order_notional is not None and args.max_order_notional <= 0:
         raise SystemExit("--max-order-notional must be > 0")
-    if args.max_order_notional < args.min_order_notional:
+    if args.max_order_notional is not None and args.max_order_notional < args.min_order_notional:
         raise SystemExit("--max-order-notional must be >= --min-order-notional")
+
+    if args.max_order_notional is None:
+        logger.info("No max order cap configured")
+    else:
+        logger.info("Max order cap configured: $%.2f", args.max_order_notional)
 
     if args.broker_name.lower() != "kraken":
         raise SystemExit("Only --broker-name kraken is supported")
@@ -411,22 +567,55 @@ def main() -> None:
             )
 
     if not args.live:
+        sell_orders = [o for o in vetted_orders if o.side.lower() == "sell"]
+        buy_orders = [o for o in vetted_orders if o.side.lower() == "buy"]
+        available_cash = max(0.0, float(getattr(account_state, "available_cash", 0.0)))
+        resized_buy_orders, skipped_buy_orders, buy_plan = _plan_cash_aware_buy_orders(
+            buy_orders=buy_orders,
+            available_cash=available_cash,
+            min_order_notional=args.min_order_notional,
+            max_order_notional=args.max_order_notional,
+        )
+        logger.info("[EXECUTION] Available cash before execution: $%.2f", available_cash)
+        logger.info("[SELL] Dry-run live sequencing would submit sells first: %s", _format_order_notionals(sell_orders))
+        logger.info("[BUY] Original buy notionals: %s", _format_order_notionals(buy_orders))
+        logger.info(
+            "[BUY] Dry-run resized buy notionals using current broker cash: %s",
+            _format_order_notionals(resized_buy_orders),
+        )
+        if skipped_buy_orders:
+            for skipped in skipped_buy_orders:
+                logger.info(
+                    "[BUY] Dry-run would skip %s: %s",
+                    skipped["symbol"],
+                    skipped["reason"],
+                )
+        logger.info(
+            "[EXECUTION] Dry-run retains pending signal. Live mode would refresh broker cash after sells before buys."
+        )
         logger.info("Dry-run mode: no orders submitted")
         # Dry-run preview must not mutate pending signal state.
         return
 
     if not vetted_orders:
-        logger.info("No vetted orders to submit in live mode")
-        clear_pending_signal()  # Clear pending if no orders
+        logger.info("[EXECUTION] No vetted orders to submit in live mode; treating pending signal as handled")
+        logger.info("[EXECUTION] Pending signal cleared: no orders survived safety checks")
+        clear_pending_signal()
         return
 
     logger.warning("LIVE MODE ENABLED: submitting orders to Kraken")
     sell_orders = [o for o in vetted_orders if o.side.lower() == "sell"]
     buy_orders = [o for o in vetted_orders if o.side.lower() == "buy"]
+    starting_available_cash = max(0.0, float(getattr(account_state, "available_cash", 0.0)))
 
     logger.info("Execution plan: %d SELL order(s), %d BUY order(s)", len(sell_orders), len(buy_orders))
+    logger.info("[EXECUTION] Available cash before execution: $%.2f", starting_available_cash)
+    logger.info("[SELL] Orders queued: %s", _format_order_notionals(sell_orders))
+    logger.info("[BUY] Original buy notionals: %s", _format_order_notionals(buy_orders))
 
     execution_results: dict[str, list[dict[str, Any]]] = {"successes": [], "failures": []}
+    skipped_orders: list[dict[str, Any]] = []
+    pending_clear_reason = "live execution reached a terminal state"
     try:
         # PHASE 1: Execute SELL orders first.
         sell_results: dict[str, list[dict[str, Any]]] = {"successes": [], "failures": []}
@@ -447,6 +636,12 @@ def main() -> None:
                 len(sell_results["successes"]),
                 len(sell_results["failures"]),
             )
+            if sell_results["successes"]:
+                logger.info(
+                    "[SELL] Waiting %.1f seconds for broker balances to settle before refreshing cash",
+                    SELL_SETTLEMENT_WAIT_SECONDS,
+                )
+                time.sleep(SELL_SETTLEMENT_WAIT_SECONDS)
         else:
             logger.info("SELL phase skipped: no sell orders")
 
@@ -470,40 +665,30 @@ def main() -> None:
         )
 
         # PHASE 3: Scale BUY orders to real available cash and execute.
-        scaled_buy_orders: list[PreparedOrder] = []
         if buy_orders:
-            logger.info("[BUY] Executing %d buy orders", len(buy_orders))
-            total_buy_notional = float(sum(o.notional_usd for o in buy_orders))
-            scale = 1.0
-            if total_buy_notional > 0 and total_buy_notional > available_cash:
-                scale = max(0.0, available_cash / total_buy_notional)
-                logger.warning(
-                    "[BUY] Scaling applied: requested=$%.2f, available=$%.2f, scale=%.4f",
-                    total_buy_notional,
-                    available_cash,
-                    scale,
-                )
+            scaled_buy_orders, skipped_buy_orders, buy_plan = _plan_cash_aware_buy_orders(
+                buy_orders=buy_orders,
+                available_cash=available_cash,
+                min_order_notional=args.min_order_notional,
+                max_order_notional=args.max_order_notional,
+            )
+            skipped_orders.extend(skipped_buy_orders)
 
-            for order in buy_orders:
-                scaled_notional = order.notional_usd * scale
-                if scaled_notional < args.min_order_notional:
-                    logger.info(
-                        "BUY order dropped after scaling below min notional: %s %.2f < %.2f",
-                        order.symbol,
-                        scaled_notional,
-                        args.min_order_notional,
-                    )
-                    continue
-                scaled_buy_orders.append(
-                    PreparedOrder(
-                        symbol=order.symbol,
-                        side=order.side,
-                        notional_usd=min(scaled_notional, args.max_order_notional),
-                    )
+            if buy_plan["requested_total"] > buy_plan["spendable_cash"]:
+                logger.warning(
+                    "[BUY] Scaling applied: requested=$%.2f, spendable=$%.2f, scale=%.4f, buffer=$%.2f",
+                    buy_plan["requested_total"],
+                    buy_plan["spendable_cash"],
+                    buy_plan["scale"],
+                    buy_plan["cash_buffer_usd"],
                 )
+            logger.info("[BUY] Resized buy notionals: %s", _format_order_notionals(scaled_buy_orders))
+            for skipped in skipped_buy_orders:
+                logger.info("[BUY] Skipping %s: %s", skipped["symbol"], skipped["reason"])
 
             buy_results: dict[str, list[dict[str, Any]]] = {"successes": [], "failures": []}
             if scaled_buy_orders:
+                logger.info("[BUY] Executing %d buy orders", len(scaled_buy_orders))
                 buy_results = _submit_kraken_orders_live(
                     orders=scaled_buy_orders,
                     api_key=api_key or "",
@@ -520,14 +705,15 @@ def main() -> None:
                     len(buy_results["failures"]),
                 )
             else:
-                logger.info("BUY phase skipped: no buy orders after scaling and min-notional filter")
+                logger.info("[BUY] BUY phase skipped: no buy orders survived cash, buffer, and min-notional checks")
+                pending_clear_reason = "buy orders were intentionally skipped after cash-aware safety checks"
 
             execution_results["successes"].extend(buy_results["successes"])
             execution_results["failures"].extend(buy_results["failures"])
         else:
             logger.info("BUY phase skipped: no buy orders")
     finally:
-        # Always clear pending after any live execution attempt to avoid stale retries.
+        logger.info("[EXECUTION] Pending signal cleared: %s", pending_clear_reason)
         clear_pending_signal()
 
     successes = execution_results["successes"]
@@ -554,6 +740,14 @@ def main() -> None:
                 f"notional=${failure['notional_usd']:.2f} error={failure['error']}"
             )
 
+    if skipped_orders:
+        print("Skipped orders:")
+        for i, skipped in enumerate(skipped_orders, 1):
+            print(
+                f"  {i}. symbol={skipped['symbol']} side={skipped['side']} "
+                f"notional=${skipped['notional_usd']:.2f} reason={skipped['reason']}"
+            )
+
     if args.notify_email:
         for success in successes:
             _notify_trade_event(
@@ -572,6 +766,15 @@ def main() -> None:
                 side=failure["side"],
                 notional_usd=failure["notional_usd"],
                 status_text=f"failed ({failure.get('phase', 'unknown')} phase): {failure['error']}",
+            )
+        for skipped in skipped_orders:
+            _notify_trade_event(
+                strategy_variant=strategy_result["strategy_variant"],
+                timestamp=str(strategy_result["timestamp"]),
+                symbol=skipped["symbol"],
+                side=skipped["side"],
+                notional_usd=skipped["notional_usd"],
+                status_text=f"skipped: {skipped['reason']}",
             )
 
     if failures and successes:
