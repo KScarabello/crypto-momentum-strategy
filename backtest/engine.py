@@ -128,10 +128,21 @@ def _apply_gross_exposure_cap(
     return target_weights * scale
 
 
+def _is_rebalance_bar_utc_hour(timestamp: pd.Timestamp, rebalance_hour_utc: int) -> bool:
+    """Return True when the bar timestamp aligns with the configured UTC hour."""
+    if not 0 <= int(rebalance_hour_utc) <= 23:
+        raise ValueError(f"rebalance_hour_utc must be in [0, 23], got {rebalance_hour_utc}")
+
+    ts = pd.Timestamp(timestamp)
+    ts_utc = ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+    return int(ts_utc.hour) == int(rebalance_hour_utc)
+
+
 def run_momentum_rotation_backtest(
     ohlcv: pd.DataFrame,
     top_n: int,
     rebalance_every_bars: int,
+    rebalance_hour_utc: int | None = None,
     short_lookback_bars: int = 7,
     medium_lookback_bars: int = 30,
     short_weight: float = 0.5,
@@ -149,18 +160,22 @@ def run_momentum_rotation_backtest(
     min_median_volume: float | None = None,
     max_turnover_per_rebalance: float | None = None,
 ) -> BacktestResult:
-    """Backtest long-only momentum rotation with periodic rebalancing and BTC regime filter."""
+    """Backtest long-only momentum rotation with deterministic UTC-hour rebalancing."""
     from config import SETTINGS
 
     if max_position_weight is None:
         max_position_weight = SETTINGS.max_position_weight
     if max_gross_exposure is None:
         max_gross_exposure = SETTINGS.max_gross_exposure
+    if rebalance_hour_utc is None:
+        rebalance_hour_utc = SETTINGS.rebalance_hour_utc
 
     if top_n <= 0:
         raise ValueError("top_n must be positive")
     if rebalance_every_bars <= 0:
         raise ValueError("rebalance_every_bars must be positive")
+    if not 0 <= int(rebalance_hour_utc) <= 23:
+        raise ValueError("rebalance_hour_utc must be in [0, 23]")
     if initial_capital <= 0:
         raise ValueError("initial_capital must be positive")
     if transaction_cost_bps < 0 or slippage_bps < 0:
@@ -242,7 +257,7 @@ def run_momentum_rotation_backtest(
 
     for i in range(start_bar, len(index) - 1):
         ts = index[i]
-        is_rebalance = (i - start_bar) % rebalance_every_bars == 0
+        is_rebalance = _is_rebalance_bar_utc_hour(ts, int(rebalance_hour_utc))
         cost_rate = 0.0
 
         # Execute prior signal with one-bar delay to avoid same-bar execution optimism.
@@ -383,6 +398,7 @@ def run_momentum_rotation(
     rebalance_every_bars: int,
     fee_bps: float,
     initial_capital: float,
+    rebalance_hour_utc: int | None = None,
 ) -> pd.DataFrame:
     """Backward-compatible wrapper for close-matrix based momentum backtests."""
     long_ohlcv = close.stack(dropna=False).rename("close").reset_index()
@@ -397,6 +413,7 @@ def run_momentum_rotation(
         ohlcv=long_ohlcv,
         top_n=top_n,
         rebalance_every_bars=rebalance_every_bars,
+        rebalance_hour_utc=rebalance_hour_utc,
         short_lookback_bars=lookback_bars,
         medium_lookback_bars=lookback_bars,
         short_weight=0.5,

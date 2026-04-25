@@ -1,3 +1,4 @@
+
 """Deterministic signal generator: Dry-run target weight calculator.
 
 This is the first deployment-stage utility for the locked baseline strategy.
@@ -39,21 +40,19 @@ _TIMEFRAME_HOURS: dict[str, int] = {
 
 def _is_rebalance_bar(
     timestamp: pd.Timestamp,
-    timeframe: str,
-    rebalance_every_bars: int,
+    rebalance_hour_utc: int,
 ) -> bool:
-    """Return True if this bar falls on a scheduled rebalance boundary.
+    """Return True when this bar is the daily UTC rebalance bar.
 
-    Logic: rebalance_period_hours = bar_hours × rebalance_every_bars.
-    A bar is a rebalance bar when its UTC hour is divisible by that period.
-    For 4h × 6 = 24h this means only the 00:00 UTC bar is a rebalance bar.
+    Rebalance timing is deterministic and wall-clock based: the latest completed
+    bar must have UTC hour equal to rebalance_hour_utc (e.g. 20 for 20:00 UTC).
     """
-    bar_hours = _TIMEFRAME_HOURS.get(timeframe.strip().lower())
-    if bar_hours is None:
-        raise ValueError(f"Unsupported timeframe for rebalance check: {timeframe!r}")
-    rebalance_period_hours = bar_hours * rebalance_every_bars
-    ts_utc = timestamp.tz_convert("UTC") if timestamp.tzinfo is not None else timestamp
-    return int(ts_utc.hour) % rebalance_period_hours == 0
+    if not 0 <= int(rebalance_hour_utc) <= 23:
+        raise ValueError(f"rebalance_hour_utc must be in [0, 23], got {rebalance_hour_utc}")
+
+    ts = pd.Timestamp(timestamp)
+    ts_utc = ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+    return int(ts_utc.hour) == int(rebalance_hour_utc)
 
 
 def _is_data_fresh(
@@ -196,7 +195,7 @@ def generate_targets(
     total_risky = float(target_weights.sum())
     cash_weight = max(0.0, 1.0 - total_risky)
 
-    rebalance_bar = _is_rebalance_bar(latest_ts, timeframe, SETTINGS.rebalance_every_bars)
+    rebalance_bar = _is_rebalance_bar(latest_ts, SETTINGS.rebalance_hour_utc)
 
     return {
         "strategy_variant": "locked_baseline",

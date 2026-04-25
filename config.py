@@ -37,6 +37,7 @@ class Settings:
     btc_symbol: str = "BTC/USD"
     regime_lookback_bars: int = 60
     rebalance_every_bars: int = 6
+    rebalance_hour_utc: int = 20
 
     transaction_cost_bps: float = 30.0
     slippage_bps: float = 15.0

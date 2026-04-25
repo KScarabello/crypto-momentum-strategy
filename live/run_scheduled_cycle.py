@@ -108,10 +108,7 @@ def _check_rebalance_timing() -> bool | None:
         if result.get("is_rebalance_bar", False):
             logger.info(f"Rebalance bar confirmed: {result['timestamp']}")
             return True
-        logger.info(
-            f"Non-rebalance bar: {result['timestamp']}. "
-            f"Exiting without action (rebalance every {SETTINGS.rebalance_every_bars}h)."
-        )
+        logger.info(f"Non-rebalance bar: {result['timestamp']}")
         return False
     except Exception as exc:
         logger.error(f"Rebalance timing check failed: {exc}")
