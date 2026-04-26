@@ -17,6 +17,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
+from config import get_trading_symbols
+
 
 MIN_POSITION_NOTIONAL_USD = 0.01
 
@@ -112,6 +114,7 @@ def load_account_state_kraken(
     api_key: str | None = None,
     api_secret: str | None = None,
     api_passphrase: str | None = None,
+    symbols: tuple[str, ...] | None = None,
 ) -> AccountState:
     """Load account state from Kraken Spot API.
 
@@ -171,6 +174,7 @@ def load_account_state_kraken(
     positions = _normalize_kraken_holdings(
         kraken=kraken,
         total_balances=total,
+        supported_symbols=symbols,
     )
     available_cash = _extract_kraken_available_cash_usd(balances)
 
@@ -207,7 +211,11 @@ def _extract_kraken_available_cash_usd(balances: dict[str, object]) -> float:
     return 0.0
 
 
-def _normalize_kraken_holdings(kraken, total_balances: dict[str, float]) -> dict[str, float]:
+def _normalize_kraken_holdings(
+    kraken,
+    total_balances: dict[str, float],
+    supported_symbols: tuple[str, ...] | None = None,
+) -> dict[str, float]:
     """Convert Kraken holdings dict to normalized strategy positions.
 
         Kraken returns total balances as a mapping, e.g.:
@@ -228,9 +236,8 @@ def _normalize_kraken_holdings(kraken, total_balances: dict[str, float]) -> dict
         Dictionary mapping normalized symbols (e.g., "BTC/USD") to USD exposure.
     """
     # Strategy universe base assets (from symbols like BTC/USD).
-    from config import SETTINGS
-
-    strategy_symbols = {sym.split("/")[0].upper() for sym in SETTINGS.symbols}
+    universe = supported_symbols or get_trading_symbols()
+    strategy_symbols = {sym.split("/")[0].upper() for sym in universe}
     positions = {}
 
     price_symbols = []
@@ -283,6 +290,7 @@ def load_account_state(
     api_key: str | None = None,
     api_secret: str | None = None,
     api_passphrase: str | None = None,
+    symbols: tuple[str, ...] | None = None,
     loader: Callable[[], AccountState] | None = None,
 ) -> AccountState:
     """Load account state from mock or Kraken.
@@ -320,6 +328,7 @@ def load_account_state(
             api_key=api_key,
             api_secret=api_secret,
             api_passphrase=api_passphrase,
+            symbols=symbols,
         )
     else:
         raise ValueError(f"Unknown source '{source}'. Choose from: mock, real")

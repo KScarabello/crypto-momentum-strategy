@@ -18,8 +18,12 @@ from pathlib import Path
 class Settings:
     """Configuration values for demo/public usage."""
 
-    # Demo placeholders only (not production universe)
-    symbols: tuple[str, ...] = ("ASSET_A/USD", "ASSET_B/USD", "ASSET_C/USD")
+    # Trading universe used for signal generation and order execution.
+    trading_symbols: tuple[str, ...] = ("BTC/USD", "ETH/USD", "XRP/USD", "SOL/USD", "AVAX/USD")
+    # Broader data-refresh universe (includes candidates not yet live-tradable).
+    data_symbols: tuple[str, ...] = ("BTC/USD", "ETH/USD", "XRP/USD", "SOL/USD", "AVAX/USD")
+    # Backward-compatible alias used by legacy research paths.
+    symbols: tuple[str, ...] = ("BTC/USD", "ETH/USD", "XRP/USD")
     timeframe: str = "demo_timeframe"
 
     top_n: int = 2
@@ -72,3 +76,33 @@ except ModuleNotFoundError as exc:
 
 if PRIVATE_SETTINGS is not None:
     SETTINGS = PRIVATE_SETTINGS
+
+
+def _as_symbol_tuple(value: object) -> tuple[str, ...]:
+    """Normalize configured symbol containers to tuple[str, ...]."""
+    if value is None:
+        return ()
+    if isinstance(value, tuple):
+        return value
+    if isinstance(value, list):
+        return tuple(value)
+    return (str(value),)
+
+
+def get_trading_symbols() -> tuple[str, ...]:
+    """Return the configured trading universe for signals and execution."""
+    symbols = _as_symbol_tuple(getattr(SETTINGS, "trading_symbols", None))
+    if symbols:
+        return symbols
+    legacy_symbols = _as_symbol_tuple(getattr(SETTINGS, "symbols", None))
+    if legacy_symbols:
+        return legacy_symbols
+    raise ValueError("No trading symbols configured")
+
+
+def get_data_symbols() -> tuple[str, ...]:
+    """Return the configured data-refresh universe."""
+    symbols = _as_symbol_tuple(getattr(SETTINGS, "data_symbols", None))
+    if symbols:
+        return symbols
+    return get_trading_symbols()

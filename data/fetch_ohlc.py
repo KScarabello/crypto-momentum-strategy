@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
-import json
 from functools import partial
 from pathlib import Path
-from typing import Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import pandas as pd
 import requests
@@ -435,6 +435,121 @@ def local_symbol_file_path(symbol: str, timeframe: str, data_dir: Path = Path("d
     """Return canonical local per-symbol OHLCV file path."""
     slug = _sanitize_symbol(symbol)
     return Path(data_dir) / f"{slug}_{timeframe}.csv"
+
+
+def load_local_symbol_ohlcv(
+    symbol: str,
+    timeframe: str,
+    data_dir: Path = Path("data/local"),
+) -> pd.DataFrame:
+    """Load one local OHLCV file if present, else return an empty normalized frame."""
+    output_path = local_symbol_file_path(symbol=symbol, timeframe=timeframe, data_dir=data_dir)
+    if not output_path.exists():
+        return pd.DataFrame(columns=NORMALIZED_COLUMNS)
+    return _validate_and_clean(_read_local_file(output_path), symbol_hint=symbol)
+
+
+def _timestamp_to_kraken_since_ms(timestamp: pd.Timestamp | None) -> int | None:
+    """Convert latest local timestamp to Kraken since milliseconds."""
+    if timestamp is None or pd.isna(timestamp):
+        return None
+    ts = pd.Timestamp(timestamp)
+    ts_utc = ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+    return int(ts_utc.timestamp() * 1000)
+
+
+def fetch_incremental_kraken_ohlcv(
+    exchange: Any,
+    symbol: str,
+    timeframe: str,
+    last_timestamp: pd.Timestamp | None,
+    limit: int = 720,
+) -> pd.DataFrame:
+    """Fetch incremental OHLCV rows from Kraken using the local file watermark."""
+    ccxt_symbol = _to_ccxt_symbol(symbol)
+    ccxt_timeframe = _to_ccxt_timeframe(timeframe)
+    since_ms = _timestamp_to_kraken_since_ms(last_timestamp)
+
+    kwargs: dict[str, Any] = {
+        "symbol": ccxt_symbol,
+        "timeframe": ccxt_timeframe,
+        "limit": int(limit),
+    }
+    if since_ms is not None:
+        kwargs["since"] = since_ms
+
+    rows = exchange.fetch_ohlcv(**kwargs)
+    if not rows:
+        return pd.DataFrame(columns=NORMALIZED_COLUMNS)
+
+    fetched = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    fetched["timestamp"] = pd.to_datetime(fetched["timestamp"], unit="ms", utc=True)
+    fetched["symbol"] = symbol
+    return fetched[NORMALIZED_COLUMNS]
+
+
+def update_symbol_ohlcv_incremental(
+    symbol: str,
+    timeframe: str,
+    data_dir: Path = Path("data/local"),
+    exchange: Any | None = None,
+    limit: int = 720,
+) -> dict[str, Any]:
+    """Incrementally update one local OHLCV CSV using Kraken candles only."""
+    logger = logging.getLogger(__name__)
+    data_dir = Path(data_dir)
+    output_path = local_symbol_file_path(symbol=symbol, timeframe=timeframe, data_dir=data_dir)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    existing = load_local_symbol_ohlcv(symbol=symbol, timeframe=timeframe, data_dir=data_dir)
+    last_timestamp = existing["timestamp"].max() if not existing.empty else None
+
+    logger.info(
+        "Updating %s from last timestamp %s",
+        symbol,
+        last_timestamp if last_timestamp is not None else "none",
+    )
+
+    kraken = exchange
+    if kraken is None:
+        try:
+            import ccxt  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise ImportError("ccxt is required for downloader mode. Install with: pip install ccxt") from exc
+        kraken = ccxt.kraken({"enableRateLimit": True})
+
+    fetched_raw = fetch_incremental_kraken_ohlcv(
+        exchange=kraken,
+        symbol=symbol,
+        timeframe=timeframe,
+        last_timestamp=last_timestamp,
+        limit=limit,
+    )
+    fetched_rows = int(len(fetched_raw))
+    logger.info("Fetched %d new rows", fetched_rows)
+
+    invalid_fetched_rows = int((pd.to_numeric(fetched_raw.get("close"), errors="coerce") <= 0).sum()) if not fetched_raw.empty else 0
+
+    frames = [frame for frame in (existing, fetched_raw) if not frame.empty]
+    if frames:
+        merged = pd.concat(frames, axis=0, ignore_index=True)
+        merged = _validate_and_clean(merged, symbol_hint=symbol)
+    else:
+        merged = pd.DataFrame(columns=NORMALIZED_COLUMNS)
+
+    logger.info("Dropped %d invalid rows", invalid_fetched_rows)
+
+    merged.to_csv(output_path, index=False)
+    logger.info("Saved total rows: %d", len(merged))
+
+    return {
+        "symbol": symbol,
+        "path": output_path,
+        "last_timestamp": last_timestamp,
+        "fetched_rows": fetched_rows,
+        "dropped_rows": invalid_fetched_rows,
+        "final_rows": int(len(merged)),
+    }
 
 
 def merge_and_save_symbol_ohlcv(

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import logging
 
-from config import SETTINGS
-from data.fetch_ohlc import build_historical_downloader, merge_and_save_symbol_ohlcv
+from config import SETTINGS, get_data_symbols
+from data.fetch_ohlc import update_symbol_ohlcv_incremental
 
 
 def configure_logging() -> None:
@@ -16,77 +16,43 @@ def configure_logging() -> None:
     )
 
 
-def download_all_symbols() -> None:
-    """Download OHLCV for configured symbols and persist per-symbol files."""
-    logger = logging.getLogger(__name__)
-    primary_downloader = build_historical_downloader(
-        provider=SETTINGS.historical_data_provider,
-        exchange_name=SETTINGS.historical_exchange_name,
-        since=SETTINGS.historical_since,
-        max_batches=SETTINGS.historical_max_batches,
-        max_rows=SETTINGS.historical_max_rows,
-        limit_per_request=SETTINGS.historical_limit_per_request,
-        request_pause_seconds=SETTINGS.historical_request_pause_seconds,
-    )
+def download_all_symbols(
+    symbols: tuple[str, ...] | None = None,
+    timeframe: str | None = None,
+) -> None:
+    """Incrementally update local OHLCV CSVs for the requested symbol universe."""
+    try:
+        import ccxt  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise ImportError("ccxt is required for downloader mode. Install with: pip install ccxt") from exc
 
-    fallback_downloader = None
-    if SETTINGS.historical_fallback_provider:
-        fallback_downloader = build_historical_downloader(
-            provider=SETTINGS.historical_fallback_provider,
-            exchange_name=None,
-            since=SETTINGS.historical_since,
-            max_batches=SETTINGS.historical_max_batches,
-            max_rows=SETTINGS.historical_max_rows,
-            limit_per_request=SETTINGS.historical_limit_per_request,
-            request_pause_seconds=SETTINGS.historical_request_pause_seconds,
-        )
+    logger = logging.getLogger(__name__)
+    symbols_to_refresh = tuple(symbols) if symbols is not None else get_data_symbols()
+    timeframe_to_use = timeframe or SETTINGS.timeframe
+    exchange = ccxt.kraken({"enableRateLimit": True})
 
     logger.info(
-        "Starting OHLCV download: provider=%s exchange=%s timeframe=%s symbols=%d fallback=%s",
-        SETTINGS.historical_data_provider,
-        SETTINGS.historical_exchange_name or "auto",
-        SETTINGS.timeframe,
-        len(SETTINGS.symbols),
-        SETTINGS.historical_fallback_provider or "none",
+        "Starting OHLCV incremental update: exchange=%s timeframe=%s symbols=%d",
+        "kraken",
+        timeframe_to_use,
+        len(symbols_to_refresh),
     )
+    logger.info("Data refresh universe: %s", ", ".join(symbols_to_refresh))
 
-    for symbol in SETTINGS.symbols:
-        logger.info("Processing symbol %s", symbol)
-        try:
-            downloaded = primary_downloader(
-                symbol=symbol,
-                timeframe=SETTINGS.timeframe,
-            )
-        except Exception as exc:
-            if fallback_downloader is None:
-                raise
-            logger.warning(
-                "Primary provider failed for %s (%s). Retrying with fallback provider %s.",
-                symbol,
-                exc,
-                SETTINGS.historical_fallback_provider,
-            )
-            downloaded = fallback_downloader(
-                symbol=symbol,
-                timeframe=SETTINGS.timeframe,
-            )
-
-        merged = merge_and_save_symbol_ohlcv(
+    for symbol in symbols_to_refresh:
+        result = update_symbol_ohlcv_incremental(
             symbol=symbol,
-            timeframe=SETTINGS.timeframe,
-            new_data=downloaded,
+            timeframe=timeframe_to_use,
             data_dir=SETTINGS.data_dir,
-            overwrite=SETTINGS.historical_overwrite,
+            exchange=exchange,
+            limit=720,
         )
-
-        min_ts = merged["timestamp"].min()
-        max_ts = merged["timestamp"].max()
         logger.info(
-            "Saved %d rows for %s | %s -> %s",
-            len(merged),
-            symbol,
-            min_ts,
-            max_ts,
+            "Incremental update complete for %s | fetched=%d dropped=%d total=%d",
+            result["symbol"],
+            result["fetched_rows"],
+            result["dropped_rows"],
+            result["final_rows"],
         )
 
 

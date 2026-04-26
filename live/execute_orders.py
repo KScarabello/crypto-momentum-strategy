@@ -18,7 +18,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-from config import SETTINGS
+from config import SETTINGS, get_trading_symbols
 from live.broker_state import load_account_state
 from live.generate_targets import generate_targets
 from live.notify_email import send_trade_notification
@@ -58,7 +58,7 @@ def _build_prepared_orders(
         strategy_result = use_pending_signal
     else:
         # Generate new targets (bar T of the signal)
-        strategy_result = generate_targets()
+        strategy_result = generate_targets(symbols=get_trading_symbols())
     
     account_state = load_account_state(
         source=broker_source,
@@ -74,7 +74,7 @@ def _build_prepared_orders(
         min_trade_notional=min_order_notional,
     )
 
-    supported_symbols = set(SETTINGS.symbols)
+    supported_symbols = set(get_trading_symbols())
     prepared = prepare_orders(
         planned_orders=planned_orders,
         supported_symbols=supported_symbols,
@@ -469,7 +469,9 @@ def main() -> None:
 
     # === PHASE 1: Load current bar and check preconditions ===
     # This determines what phase of the one-bar-delay cycle we're in.
-    current_bar = generate_targets()
+    trading_symbols = get_trading_symbols()
+    logger.info("Trading symbols selected for signals/execution: %s", ", ".join(trading_symbols))
+    current_bar = generate_targets(symbols=trading_symbols)
 
     if not current_bar.get("is_rebalance_bar", True):
         logger.info("[SKIP] Non-rebalance bar: %s. No action taken.", current_bar["timestamp"])
@@ -531,7 +533,7 @@ def main() -> None:
     # === PHASE 3: Build and execute pending signal ===
     vetted_orders = _apply_execution_safeguards(
         prepared_orders=prepared_orders,
-        supported_symbols=set(SETTINGS.symbols),
+        supported_symbols=set(trading_symbols),
         min_order_notional=args.min_order_notional,
         max_order_notional=args.max_order_notional,
     )

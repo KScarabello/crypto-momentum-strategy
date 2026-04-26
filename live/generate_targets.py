@@ -16,7 +16,7 @@ from datetime import datetime
 import pandas as pd
 
 from backtest.engine import _apply_gross_exposure_cap, _apply_position_weight_cap, _build_target_weights
-from config import SETTINGS
+from config import SETTINGS, get_trading_symbols
 from data.fetch_ohlc import load_ohlcv_history
 from strategy.momentum import check_regime_filter, compute_momentum_score, rank_symbols_for_date
 
@@ -89,7 +89,7 @@ def _close_matrix(ohlcv: pd.DataFrame) -> pd.DataFrame:
 
 
 def generate_targets(
-    symbols: tuple[str, ...] = SETTINGS.symbols,
+    symbols: tuple[str, ...] | None = None,
     timeframe: str = SETTINGS.timeframe,
     data_dir: str | None = None,
 ) -> dict[str, object]:
@@ -123,6 +123,8 @@ def generate_targets(
     """
     if data_dir is None:
         data_dir = SETTINGS.data_dir
+    if symbols is None:
+        symbols = get_trading_symbols()
 
     # Load latest local OHLCV data
     ohlcv = load_ohlcv_history(

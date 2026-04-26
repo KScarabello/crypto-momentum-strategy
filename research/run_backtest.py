@@ -15,7 +15,7 @@ from pathlib import Path
 
 from backtest.engine import BacktestResult, run_momentum_rotation_backtest
 from backtest.metrics import summary_metrics
-from config import SETTINGS
+from config import SETTINGS, get_trading_symbols
 from data.fetch_ohlc import build_historical_downloader, load_ohlcv_history
 
 
@@ -109,6 +109,9 @@ def main() -> None:
     """Load data, run backtest, print metrics, and save output files."""
     configure_logging()
     logger = logging.getLogger(__name__)
+    trading_symbols = get_trading_symbols()
+
+    logger.info("Backtest trading universe: %s", ", ".join(trading_symbols))
     downloader = None
     if SETTINGS.use_downloader:
         downloader = build_historical_downloader(
@@ -130,9 +133,9 @@ def main() -> None:
     else:
         logger.info("Downloader fallback disabled; loading local files only")
 
-    logger.info("Loading OHLCV data for %d symbols at %s", len(SETTINGS.symbols), SETTINGS.timeframe)
+    logger.info("Loading OHLCV data for %d symbols at %s", len(trading_symbols), SETTINGS.timeframe)
     ohlcv = load_ohlcv_history(
-        symbols=SETTINGS.symbols,
+        symbols=trading_symbols,
         timeframe=SETTINGS.timeframe,
         data_dir=SETTINGS.data_dir,
         downloader=downloader,

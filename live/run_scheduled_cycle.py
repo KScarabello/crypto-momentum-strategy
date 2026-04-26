@@ -35,7 +35,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from config import SETTINGS
+from config import SETTINGS, get_data_symbols, get_trading_symbols
 from data.download_ohlcv import download_all_symbols
 from live.generate_targets import generate_targets
 from live.signal_state import has_pending_signal, load_pending_signal
@@ -54,17 +54,18 @@ def _refresh_ohlcv_data(symbols: tuple[str, ...], timeframe: str = "4h") -> bool
     """Refresh local OHLCV data from configured provider for all symbols.
     
     Args:
-        symbols: Tuple of symbols to download (used for logging only, download uses SETTINGS.symbols)
-        timeframe: Timeframe for OHLCV bars (used for logging only, download uses SETTINGS.timeframe)
+        symbols: Tuple of symbols to download and refresh.
+        timeframe: Timeframe for OHLCV bars to refresh.
     
     Returns:
         True if refresh succeeded, False otherwise
     """
     logger = logging.getLogger(__name__)
     logger.info("Refreshing local OHLCV data from configured provider")
+    logger.info("Data symbols selected for refresh: %s", ", ".join(symbols))
     
     try:
-        download_all_symbols()
+        download_all_symbols(symbols=symbols, timeframe=timeframe)
         logger.info("OHLCV data refresh completed successfully")
         return True
     except Exception as exc:
@@ -79,9 +80,11 @@ def _verify_data_freshness() -> bool:
         True if data is fresh, False otherwise
     """
     logger = logging.getLogger(__name__)
+    trading_symbols = get_trading_symbols()
+    logger.info("Trading symbols selected for signal checks: %s", ", ".join(trading_symbols))
     
     try:
-        result = generate_targets()
+        result = generate_targets(symbols=trading_symbols)
         if not result.get("data_fresh", False):
             logger.error(
                 f"Stale OHLCV data: latest bar {result['timestamp']} "
@@ -102,9 +105,10 @@ def _check_rebalance_timing() -> bool | None:
         True if rebalance bar, False if non-rebalance (safe to exit), None on error
     """
     logger = logging.getLogger(__name__)
+    trading_symbols = get_trading_symbols()
     
     try:
-        result = generate_targets()
+        result = generate_targets(symbols=trading_symbols)
         if result.get("is_rebalance_bar", False):
             logger.info(f"Rebalance bar confirmed: {result['timestamp']}")
             return True
@@ -189,11 +193,16 @@ def main() -> None:
     load_dotenv()
 
     # === STAGE 1: Refresh OHLCV Data ===
+    data_symbols = get_data_symbols()
+    trading_symbols = get_trading_symbols()
+    logger.info("Configured data refresh universe: %s", ", ".join(data_symbols))
+    logger.info("Configured trading execution universe: %s", ", ".join(trading_symbols))
+
     logger.info("=" * 80)
     logger.info("STAGE 1: Refresh OHLCV Data")
     logger.info("=" * 80)
 
-    if not _refresh_ohlcv_data(symbols=SETTINGS.symbols, timeframe=SETTINGS.timeframe):
+    if not _refresh_ohlcv_data(symbols=data_symbols, timeframe=SETTINGS.timeframe):
         logger.error("OHLCV data refresh failed. Aborting cycle.")
         sys.exit(1)
 

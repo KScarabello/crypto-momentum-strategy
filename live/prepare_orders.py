@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
-from config import SETTINGS
+from config import SETTINGS, get_trading_symbols
 from live.broker_state import load_account_state
 from live.generate_targets import generate_targets
 from live.plan_orders import Order, plan_trades
@@ -172,7 +172,7 @@ def main() -> None:
 
     logger.info("Preparing dry-run executable orders")
 
-    strategy_result = generate_targets()
+    strategy_result = generate_targets(symbols=get_trading_symbols())
     account_state = load_account_state(
         source=args.broker_source,
         api_key=api_key,
@@ -187,7 +187,7 @@ def main() -> None:
         min_trade_notional=args.min_trade_notional,
     )
 
-    supported_symbols = set(SETTINGS.symbols)
+    supported_symbols = set(get_trading_symbols())
     prepared_orders = prepare_orders(
         planned_orders=planned_orders,
         supported_symbols=supported_symbols,
