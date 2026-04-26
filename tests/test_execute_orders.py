@@ -3,7 +3,11 @@ from __future__ import annotations
 import sys
 import types
 
-from live.execute_orders import _plan_cash_aware_buy_orders, _submit_kraken_orders_live
+from live.execute_orders import (
+    _dedupe_success_notifications,
+    _plan_cash_aware_buy_orders,
+    _submit_kraken_orders_live,
+)
 from live.prepare_orders import PreparedOrder
 
 
@@ -160,3 +164,32 @@ def test_submit_kraken_orders_live_caps_sell_by_available_asset_balance(monkeypa
     assert len(results["successes"]) == 1
     assert results["successes"][0]["amount"] == 1.5
     assert results["successes"][0]["notional_usd"] == 15.0
+
+
+def test_dedupe_success_notifications_removes_duplicate_order_ids() -> None:
+    successes = [
+        {
+            "symbol": "BTC/USD",
+            "side": "buy",
+            "notional_usd": 100.0,
+            "response": {"id": "order-1"},
+        },
+        {
+            "symbol": "BTC/USD",
+            "side": "buy",
+            "notional_usd": 100.0,
+            "response": {"id": "order-1"},
+        },
+        {
+            "symbol": "ETH/USD",
+            "side": "buy",
+            "notional_usd": 50.0,
+            "response": {"id": "order-2"},
+        },
+    ]
+
+    deduped = _dedupe_success_notifications(successes)
+
+    assert len(deduped) == 2
+    assert deduped[0]["response"]["id"] == "order-1"
+    assert deduped[1]["response"]["id"] == "order-2"

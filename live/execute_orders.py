@@ -188,6 +188,23 @@ def _notify_trade_event(
         logging.getLogger(__name__).warning("Email notification failed: %s", exc)
 
 
+def _dedupe_success_notifications(successes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return successes with duplicate order IDs removed for notification safety."""
+    deduped: list[dict[str, Any]] = []
+    seen_order_ids: set[str] = set()
+
+    for success in successes:
+        response = success.get("response", {})
+        order_id = str(response.get("id", "")).strip()
+        if order_id:
+            if order_id in seen_order_ids:
+                continue
+            seen_order_ids.add(order_id)
+        deduped.append(success)
+
+    return deduped
+
+
 def _format_order_notionals(orders: list[PreparedOrder]) -> str:
     """Format a concise per-order notional summary for logs."""
     if not orders:
@@ -546,7 +563,7 @@ def main() -> None:
         live=args.live,
     )
 
-    if args.notify_email:
+    if args.notify_email and not args.live:
         preview_status = "live preview" if args.live else "dry-run preview"
         if vetted_orders:
             for order in vetted_orders:
@@ -751,14 +768,25 @@ def main() -> None:
             )
 
     if args.notify_email:
-        for success in successes:
+        notified_successes = _dedupe_success_notifications(successes)
+        for success in notified_successes:
+            response = success.get("response", {})
+            order_id = str(response.get("id", "unknown"))
+            logger.info(
+                "[NOTIFY] Sending execution notification: order_id=%s symbol=%s",
+                order_id,
+                success["symbol"],
+            )
             _notify_trade_event(
                 strategy_variant=strategy_result["strategy_variant"],
                 timestamp=str(strategy_result["timestamp"]),
                 symbol=success["symbol"],
                 side=success["side"],
                 notional_usd=success["notional_usd"],
-                status_text=f"submitted ({success.get('phase', 'unknown')} phase)",
+                status_text=(
+                    f"submitted ({success.get('phase', 'unknown')} phase) "
+                    f"order_id={order_id}"
+                ),
             )
         for failure in failures:
             _notify_trade_event(
