@@ -19,6 +19,7 @@ env/
 data/local/
 outputs/
 outputs_*/
+logs/
 *.log
 
 # Signal state (pending signals from one-bar-delayed execution)
@@ -26,3 +27,6 @@ outputs_*/
 
 # Secrets
 .env
+
+# Private parameter overrides
+config_private.py
