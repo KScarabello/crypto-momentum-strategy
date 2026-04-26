@@ -1,147 +1,165 @@
-Crypto Momentum Research
+# Quant Research Backtesting Framework
 
-Python research framework for developing and evaluating systematic crypto trading strategies using historical OHLCV data.
+Lightweight Python framework for **systematic trading research** with emphasis on:
 
-The repository focuses on reproducible research workflows, execution-aware backtesting, and clean separation between research logic and deployment-specific configuration.
+- **Execution-aware backtesting**
+- **Reproducibility**
+- **Modular architecture**
 
-Project Purpose
+This repository is designed for research workflows and strategy evaluation, not direct production deployment.
 
-This repository is designed for strategy research and validation, not production execution.
+---
 
-Core goals:
+## Purpose
 
-Evaluate systematic allocation strategies on historical market data
-Incorporate realistic execution assumptions (costs, slippage, turnover)
-Enable reproducible local backtests from persisted datasets
+This project provides a concise pipeline to:
 
-The codebase emphasizes clarity, modularity, and realistic assumptions over breadth or feature completeness.
+- Load and validate historical OHLCV market data  
+- Generate portfolio targets from configurable research signals  
+- Simulate strategy behavior under realistic execution assumptions  
+- Produce repeatable diagnostics and output artifacts  
 
-Strategy Overview
+Core principles:
 
-At a high level, the research workflow:
+- **Deterministic runs**
+- **Transparent experiment flow**
+- **Clear separation of concerns** across data, strategy, simulation, and reporting  
 
-Compute signals across multiple time horizons
-Combine signals into a composite ranking
-Select a subset of assets based on relative strength
-Optionally apply a market-state filter
-Construct a portfolio subject to basic constraints
-Rebalance periodically
+---
 
-Backtests are designed to reflect practical constraints, including:
+## Strategy Overview
 
-Long-only portfolio construction
-No leverage or shorting
-Transaction costs and optional slippage
-Turnover-aware rebalancing
+At a conceptual level, the framework supports:
 
-Specific production parameters and configurations are intentionally excluded from this public repository.
+- **Signal generation** from historical observations  
+- **Periodic rebalancing** under configurable scheduling  
+- **Portfolio constraints** and optional risk controls  
+- **Execution-friction modeling** (for example, transaction costs and slippage)  
 
-Repository Structure
-config.py
-Public-safe configuration defaults (demo values only).
-Real research parameters are loaded from a local config_private.py (not tracked).
-data/fetch_ohlc.py
-Local-first OHLCV loader, validation utilities, and downloader integrations
-data/download_ohlcv.py
-Script for downloading and persisting historical data locally
-strategy/
-Signal construction, ranking, and filtering logic
-backtest/engine.py
-Portfolio simulation engine
-backtest/metrics.py
-Performance and risk metrics
-research/run_backtest.py
-End-to-end research script
-tests/
-Focused unit tests for core components
-Configuration
+Specific production parameters and proprietary configurations are intentionally excluded from this public repository.
 
-The repo uses a two-layer configuration approach:
+---
 
-config.py → public-safe defaults
-config_private.py → local, non-public research parameters
+## Repository Structure
 
-If config_private.py is present, it overrides the public defaults at runtime.
+- `config.py`  
+  Public-safe defaults and configuration entrypoint  
 
-This design keeps proprietary research parameters out of version control.
+- `data/fetch_ohlc.py`  
+  Data loading, normalization, and validation utilities  
 
-Data
+- `data/download_ohlcv.py`  
+  Historical data download helper  
 
-By default, the system reads local OHLCV data from:
+- `strategy/`  
+  Signal construction and ranking components  
 
-data/local/
+- `backtest/engine.py`  
+  Execution-aware simulation engine  
 
-Expected columns:
+- `backtest/metrics.py`  
+  Performance and diagnostics calculations  
 
-timestamp
-open
-high
-low
-close
-volume
-symbol
+- `research/`  
+  End-to-end research scripts and experiment runners  
+
+- `live/`  
+  Execution orchestration and scheduling scaffolding  
+
+- `tests/`  
+  Unit tests for strategy, engine, and metrics behavior  
+
+---
+
+## Configuration
+
+Configuration loading supports two layers:
+
+1. `config.py` → public-safe demo defaults  
+2. `config_private.py` → local, non-public overrides  
+
+Runtime behavior:
+
+- If `config_private.py` exists, its `SETTINGS` override public defaults  
+- Otherwise, the repository uses `config.py` defaults  
+
+This pattern preserves runtime compatibility while keeping sensitive parameters out of source control.
+
+---
+
+## Data Requirements
+
+Default local data path:
+
+- `data/local/`
+
+Expected OHLCV columns:
+
+- `timestamp`
+- `open`
+- `high`
+- `low`
+- `close`
+- `volume`
+- `symbol`
 
 Loader behavior:
 
-Prefers local files (.csv or .parquet)
-Normalizes schema
-Parses timestamps as UTC
-Deduplicates rows
-Returns a unified dataset across symbols
-Downloading Historical Data
+- Local-first ingestion  
+- UTC timestamp normalization  
+- Duplicate handling on `(symbol, timestamp)`  
+- Multi-asset merge for downstream analysis  
 
-Run:
+---
 
-python -m data.download_ohlcv
+## Setup
 
-Supports configurable data providers and exchange integrations.
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
 
-Downloader features:
+---
 
-Batched historical requests
-Local persistence per symbol
-Merge + deduplication
-Configurable limits and safety guards
+## Running Research
 
-Recommended workflow:
+Run the primary backtest workflow:
 
-Download and persist local data
-Run research exclusively on local datasets
-Running a Backtest
-
-Run:
-
+```bash
 python -m research.run_backtest
+```
 
-This will:
+Optional data refresh:
 
-Load configuration
-Load historical data
-Execute the backtest
-Output summary metrics
-Save result artifacts
-Outputs
+```bash
+python -m data.download_ohlcv
+```
 
-Written to output_dir:
+---
 
-equity_curve.csv
-rebalance_log.csv
-holdings_history.csv
-Scope
+## Outputs
 
-This repository intentionally excludes:
+Research runs write artifacts to the configured output directory, typically including:
 
-Live trading systems
-Broker integrations
-Streaming pipelines
-Production infrastructure
-Large-scale parameter optimization
-Notes
+- Equity curve time series  
+- Rebalance/event logs  
+- Holdings history  
+- Experiment summary tables (where applicable)  
 
-This project reflects an execution-aware approach to systematic strategy research, with emphasis on:
+---
 
-realistic assumptions
-reproducibility
-modular design
+## Reproducibility Notes
 
-It is intended as a research tool, not a finished trading system.
+For consistent, repeatable results:
+
+- Pin dependencies in `requirements.txt`  
+- Keep datasets immutable per experiment window  
+- Store output artifacts alongside run metadata  
+- Track configuration snapshots for each experiment  
+
+---
+
+## Audience
+
+Built for **quant research** and **systematic trading** practitioners seeking a compact, auditable research framework.
