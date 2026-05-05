@@ -5,8 +5,8 @@ Call this every 4 hours to execute the complete pipeline:
 
   1. Refresh local OHLCV data
   2. Check data freshness
-  3. Enforce rebalance timing
-  4. Execute one-bar-delayed signals
+    3. Execute due pending signals first (one-bar delay)
+    4. If no pending execution is due, enforce rebalance timing
   5. Send notifications
 
 Usage:
@@ -27,18 +27,24 @@ Execution bar: executes pending signal and clears it.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
+import pandas as pd
 from dotenv import load_dotenv
 
 from config import SETTINGS, get_data_symbols, get_trading_symbols
 from data.download_ohlcv import download_all_symbols
 from live.generate_targets import generate_targets
 from live.signal_state import has_pending_signal, load_pending_signal
+
+
+EXECUTION_LOCK_FILE = Path(".signals") / "scheduled_cycle_execution.lock"
 
 
 def configure_logging() -> logging.Logger:
@@ -98,47 +104,112 @@ def _verify_data_freshness() -> bool:
         return False
 
 
-def _check_rebalance_timing() -> bool | None:
-    """Check if current bar is a rebalance bar.
-    
-    Returns:
-        True if rebalance bar, False if non-rebalance (safe to exit), None on error
-    """
+def _load_current_bar_snapshot() -> dict[str, object] | None:
+    """Load the latest strategy snapshot for timestamp/rebalance decisions."""
     logger = logging.getLogger(__name__)
     trading_symbols = get_trading_symbols()
-    
+
     try:
-        result = generate_targets(symbols=trading_symbols)
-        if result.get("is_rebalance_bar", False):
-            logger.info(f"Rebalance bar confirmed: {result['timestamp']}")
-            return True
-        logger.info(f"Non-rebalance bar: {result['timestamp']}")
-        return False
+        snapshot = generate_targets(symbols=trading_symbols)
+        logger.info("Latest bar snapshot loaded: %s", snapshot["timestamp"])
+        return snapshot
     except Exception as exc:
-        logger.error(f"Rebalance timing check failed: {exc}")
+        logger.error(f"Failed to load latest bar snapshot: {exc}")
         return None
 
 
-def _check_pending_signal_state() -> str:
-    """Check pending signal state and return phase indicator.
-    
-    Returns:
-        "decision": No pending signal, this is decision bar (save it)
-        "execution": Pending signal exists, ready to execute
-        "wait": Error state
-    """
+def _is_after_decision_bar(current_timestamp: object, decision_timestamp: object) -> bool:
+    """Return True if current bar is strictly after pending decision bar."""
+    current_ts = pd.Timestamp(current_timestamp)
+    decision_ts = pd.Timestamp(decision_timestamp)
+    return current_ts > decision_ts
+
+
+def _acquire_execution_lock(ttl_seconds: int = 6 * 60 * 60) -> bool:
+    """Acquire single-run execution lock to avoid double execution on overlapping cron runs."""
     logger = logging.getLogger(__name__)
-    
-    if has_pending_signal():
-        pending = load_pending_signal()
-        logger.info(
-            f"Pending signal found from decision bar {pending['timestamp']}. "
-            f"Ready for execution on next bar."
-        )
-        return "execution"
-    else:
-        logger.info("No pending signal. This will be the decision bar.")
-        return "decision"
+    EXECUTION_LOCK_FILE.parent.mkdir(exist_ok=True)
+
+    now = int(time.time())
+    payload = {"pid": os.getpid(), "created_at": now}
+
+    def _try_create() -> bool:
+        try:
+            fd = os.open(str(EXECUTION_LOCK_FILE), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+            return True
+        except FileExistsError:
+            return False
+
+    if _try_create():
+        logger.info("Execution lock acquired: %s", EXECUTION_LOCK_FILE)
+        return True
+
+    try:
+        with open(EXECUTION_LOCK_FILE, "r", encoding="utf-8") as handle:
+            lock_data = json.load(handle)
+        created_at = int(lock_data.get("created_at", 0))
+    except Exception:
+        created_at = 0
+
+    if created_at > 0 and (now - created_at) > ttl_seconds:
+        logger.warning("Found stale execution lock older than %ss; removing it", ttl_seconds)
+        try:
+            EXECUTION_LOCK_FILE.unlink()
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            logger.warning("Could not remove stale execution lock: %s", exc)
+            return False
+
+        if _try_create():
+            logger.info("Execution lock re-acquired after stale lock cleanup")
+            return True
+
+    logger.info("Execution lock already held by another run; skipping duplicate execution")
+    return False
+
+
+def _release_execution_lock() -> None:
+    """Release single-run execution lock if held by this run."""
+    logger = logging.getLogger(__name__)
+    try:
+        EXECUTION_LOCK_FILE.unlink()
+        logger.info("Execution lock released")
+    except FileNotFoundError:
+        return
+    except Exception as exc:
+        logger.warning("Failed to release execution lock: %s", exc)
+
+
+def _build_execute_orders_cmd(args: argparse.Namespace) -> list[str]:
+    """Build subprocess command for execute_orders with inherited CLI settings."""
+    cmd = [
+        sys.executable,
+        "-m",
+        "live.execute_orders",
+        "--broker-source",
+        args.broker_source,
+        "--broker-name",
+        args.broker_name,
+        "--min-order-notional",
+        str(args.min_order_notional),
+    ]
+
+    if args.max_order_notional is not None:
+        cmd.extend([
+            "--max-order-notional",
+            str(args.max_order_notional),
+        ])
+
+    if args.live:
+        cmd.append("--live")
+
+    if args.notify_email:
+        cmd.append("--notify-email")
+
+    return cmd
 
 
 def main() -> None:
@@ -216,78 +287,103 @@ def main() -> None:
         logger.error("Data freshness check failed. Aborting cycle.")
         sys.exit(1)
 
-    # === STAGE 3: Check Rebalance Timing ===
+    # === STAGE 3: Load Current Bar Snapshot ===
     logger.info("")
     logger.info("=" * 80)
-    logger.info("STAGE 3: Check Rebalance Timing")
+    logger.info("STAGE 3: Load Current Bar Snapshot")
     logger.info("=" * 80)
 
-    is_rebalance = _check_rebalance_timing()
-    if is_rebalance is None:
-        logger.error("Rebalance timing check failed. Aborting cycle.")
+    current_bar = _load_current_bar_snapshot()
+    if current_bar is None:
+        logger.error("Current bar snapshot failed. Aborting cycle.")
         sys.exit(1)
 
-    if not is_rebalance:
-        logger.info("Non-rebalance bar. Cycle ending safely (no action taken).")
-        return
-
-    # === STAGE 4: Check Pending Signal State ===
+    # === STAGE 4: Check Pending Signal First ===
     logger.info("")
     logger.info("=" * 80)
-    logger.info("STAGE 4: Check Pending Signal State")
+    logger.info("STAGE 4: Check Pending Signal First")
     logger.info("=" * 80)
 
-    phase = _check_pending_signal_state()
+    pending_signal = load_pending_signal() if has_pending_signal() else None
+    phase = "none"
 
-    # === STAGE 5: Call Execute Orders Pipeline ===
-    logger.info("")
-    logger.info("=" * 80)
-    logger.info("STAGE 5: Execute Orders Pipeline")
-    logger.info("=" * 80)
+    if pending_signal is not None:
+        decision_timestamp = pending_signal.get("timestamp")
+        current_timestamp = current_bar.get("timestamp")
 
-    # Build command to call execute_orders.py with same arguments
-    cmd = [
-        sys.executable,
-        "-m",
-        "live.execute_orders",
-        "--broker-source",
-        args.broker_source,
-        "--broker-name",
-        args.broker_name,
-        "--min-order-notional",
-        str(args.min_order_notional),
-    ]
+        if decision_timestamp is None or current_timestamp is None:
+            logger.error("Pending/current timestamp missing; refusing execution to avoid unsafe action")
+            sys.exit(1)
 
-    if args.max_order_notional is not None:
-        cmd.extend([
-            "--max-order-notional",
-            str(args.max_order_notional),
-        ])
+        if _is_after_decision_bar(current_timestamp=current_timestamp, decision_timestamp=decision_timestamp):
+            logger.info(
+                "Pending signal detected from %s and current bar is %s; executing now",
+                decision_timestamp,
+                current_timestamp,
+            )
 
-    if args.live:
-        cmd.append("--live")
+            if not _acquire_execution_lock():
+                logger.info("Another run is already executing pending signal. Ending this run safely.")
+                return
 
-    if args.notify_email:
-        cmd.append("--notify-email")
+            cmd = _build_execute_orders_cmd(args)
+            logger.info(f"Calling: {' '.join(cmd)}")
+            try:
+                result = subprocess.run(cmd, check=False)
+                if result.returncode != 0:
+                    logger.error(f"Execute orders pipeline exited with code {result.returncode}")
+                    sys.exit(result.returncode)
 
-    logger.info(f"Calling: {' '.join(cmd)}")
+                phase = "execution"
+            except Exception as exc:
+                logger.error(f"Execute orders pipeline failed: {exc}")
+                sys.exit(1)
+            finally:
+                _release_execution_lock()
+        else:
+            logger.info(
+                "Pending signal from %s is not yet executable on current bar %s. No action.",
+                decision_timestamp,
+                current_timestamp,
+            )
+            return
+    else:
+        logger.info("No pending signal found; proceeding to rebalance check.")
 
-    try:
-        result = subprocess.run(cmd, check=False)
-        if result.returncode != 0:
-            logger.error(f"Execute orders pipeline exited with code {result.returncode}")
-            sys.exit(result.returncode)
-    except Exception as exc:
-        logger.error(f"Execute orders pipeline failed: {exc}")
-        sys.exit(1)
+    # === STAGE 5: Rebalance Check and Decision Signal ===
+    if phase != "execution":
+        logger.info("")
+        logger.info("=" * 80)
+        logger.info("STAGE 5: Rebalance Check and Decision Signal")
+        logger.info("=" * 80)
+
+        is_rebalance = bool(current_bar.get("is_rebalance_bar", False))
+        if not is_rebalance:
+            logger.info("Non-rebalance bar with no executable pending signal. Cycle ending safely.")
+            return
+
+        logger.info("Rebalance bar confirmed: %s", current_bar.get("timestamp"))
+        cmd = _build_execute_orders_cmd(args)
+        logger.info(f"Calling: {' '.join(cmd)}")
+        try:
+            result = subprocess.run(cmd, check=False)
+            if result.returncode != 0:
+                logger.error(f"Execute orders pipeline exited with code {result.returncode}")
+                sys.exit(result.returncode)
+            phase = "decision"
+        except Exception as exc:
+            logger.error(f"Execute orders pipeline failed: {exc}")
+            sys.exit(1)
 
     # === CYCLE COMPLETE ===
     logger.info("")
     logger.info("=" * 80)
     if phase == "decision":
         logger.info("CYCLE COMPLETE: Pending signal saved (decision bar)")
-    else:
+    elif phase == "execution":
         logger.info("CYCLE COMPLETE: Orders executed (execution bar)")
+    else:
+        logger.info("CYCLE COMPLETE: No action")
     logger.info("=" * 80)
 
 

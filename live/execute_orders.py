@@ -490,10 +490,6 @@ def main() -> None:
     logger.info("Trading symbols selected for signals/execution: %s", ", ".join(trading_symbols))
     current_bar = generate_targets(symbols=trading_symbols)
 
-    if not current_bar.get("is_rebalance_bar", True):
-        logger.info("[SKIP] Non-rebalance bar: %s. No action taken.", current_bar["timestamp"])
-        return
-
     if not current_bar.get("data_fresh", True):
         print(
             f"\nStale data: OHLCV data is not fresh enough (latest bar: {current_bar['timestamp']}, "
@@ -506,18 +502,17 @@ def main() -> None:
     pending_signal = load_pending_signal() if has_pending_signal() else None
 
     if pending_signal is not None:
-        # We have a pending signal from the previous bar.
-        # Check if current bar is the next bar (eligible for execution).
-        is_execution_bar = _is_next_bar(
-            decision_timestamp=pending_signal["timestamp"],
-            current_timestamp=current_bar["timestamp"],
-            timeframe=SETTINGS.timeframe,
-        )
+        # Pending execution is eligible on any bar strictly after the decision bar.
+        import pandas as pd
+
+        decision_ts = pd.Timestamp(pending_signal["timestamp"])
+        current_ts = pd.Timestamp(current_bar["timestamp"])
+        is_execution_bar = current_ts > decision_ts
 
         if not is_execution_bar:
             print(
                 f"\nWaiting for execution bar: pending signal from {pending_signal['timestamp']}, "
-                f"current bar {current_bar['timestamp']}, will execute on next rebalance bar."
+                f"current bar {current_bar['timestamp']}, will execute once a later bar is available."
             )
             return
 
@@ -534,6 +529,11 @@ def main() -> None:
         )
     else:
         # No pending signal. This is the decision bar (phase 1 of delay).
+        # Only generate new decision signals on rebalance bars.
+        if not current_bar.get("is_rebalance_bar", True):
+            logger.info("[SKIP] Non-rebalance bar with no pending signal: %s. No action taken.", current_bar["timestamp"])
+            return
+
         # Generate signal, save as pending, and exit.
         logger.info(
             "[DECISION] Signal generated at %s. Saved for next bar execution.",
