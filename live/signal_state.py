@@ -37,7 +37,15 @@ def save_pending_signal(signal_dict: dict[str, Any]) -> None:
     _ensure_signal_dir()
     with open(PENDING_SIGNAL_FILE, "w") as f:
         json.dump(signal_dict, f, indent=2, default=str)
-    LOGGER.info(f"Saved pending signal (decision bar: {signal_dict['timestamp']})")
+    LOGGER.info(
+        "Saved pending signal | decision_bar=%s selected=%s target_weights=%s risk_on=%s is_rebalance_bar=%s data_fresh=%s",
+        signal_dict.get("timestamp"),
+        signal_dict.get("selected_symbols"),
+        signal_dict.get("target_weights"),
+        signal_dict.get("risk_on"),
+        signal_dict.get("is_rebalance_bar"),
+        signal_dict.get("data_fresh"),
+    )
 
 
 def load_pending_signal() -> dict[str, Any] | None:
@@ -50,7 +58,15 @@ def load_pending_signal() -> dict[str, Any] | None:
         return None
     with open(PENDING_SIGNAL_FILE, "r") as f:
         signal = json.load(f)
-    LOGGER.info(f"Loaded pending signal (decision bar: {signal['timestamp']})")
+    LOGGER.info(
+        "Loaded pending signal | decision_bar=%s selected=%s target_weights=%s risk_on=%s is_rebalance_bar=%s data_fresh=%s",
+        signal.get("timestamp"),
+        signal.get("selected_symbols"),
+        signal.get("target_weights"),
+        signal.get("risk_on"),
+        signal.get("is_rebalance_bar"),
+        signal.get("data_fresh"),
+    )
     return signal
 
 

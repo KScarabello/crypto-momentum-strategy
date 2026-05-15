@@ -517,6 +517,12 @@ def main() -> None:
             return
 
         logger.info("[EXECUTION] Executing pending signal from %s", pending_signal["timestamp"])
+        logger.info(
+            "[EXECUTION] Pending signal payload | decision_bar=%s selected=%s target_weights=%s",
+            pending_signal.get("timestamp"),
+            pending_signal.get("selected_symbols"),
+            pending_signal.get("target_weights"),
+        )
 
         # Use the pending signal for execution (not current bar).
         strategy_result, account_state, prepared_orders = _build_prepared_orders(
