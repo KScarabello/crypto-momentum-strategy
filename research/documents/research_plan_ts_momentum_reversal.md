@@ -98,3 +98,27 @@ Initial universe:
 - AVAX/USD
 
 The research code is written so symbol count can expand (for example to around 20 assets) without changing strategy logic.
+
+## 7. Expanded Universe Data Acquisition and Asset Eligibility
+
+- The initial 5-asset universe is used as a fast debugging baseline.
+- Expanded-universe research requires local 4h OHLCV files per symbol before strategy comparison is considered reliable.
+- Assets must not be treated as tradable before their local data inception timestamps.
+- Assets must not be considered eligible until enough lookback history exists for the required signals (for the current strategy, 8-week momentum is the longest lookback).
+- Eligibility logic is centralized in research/asset_eligibility.py so multiple research strategies can reuse the same rules and avoid lookahead-style mistakes.
+
+## 8. Historical Backfill Window
+
+The first expanded-universe research target is approximately four years of 4-hour data where available, starting from 2022-01-01.
+
+Run the fetch script with:
+
+```
+python -m research.fetch_expanded_universe_data --timeframe 4h --since 2022-01-01
+```
+
+Key design decisions:
+
+- Each asset's actual available start date is preserved. No rows are synthesised before the exchange first returned data for that symbol.
+- If the exchange returns only a recent window despite an older `--since` date (e.g. because the asset listed after 2022 or because the data source has limited history), a warning is logged and the actual inception date is used as-is.
+- The eligibility summary (research/results/expanded_universe_data_summary.csv) reflects the real first timestamp per symbol, not the requested since date.

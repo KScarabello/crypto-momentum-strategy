@@ -166,8 +166,8 @@ def momentum_with_entry_filter_and_exit_signal_weights(
     over = _validate_signal_frame(overextension_signal, "overextension_signal")
     if not momentum.index.equals(over.index) or not momentum.columns.equals(over.columns):
         raise ValueError("momentum_signal and overextension_signal must have identical index/columns")
-    if entry_overextension_threshold >= exit_overextension_threshold:
-        raise ValueError("entry_overextension_threshold should be lower than exit_overextension_threshold")
+    if entry_overextension_threshold > exit_overextension_threshold:
+        raise ValueError("entry_overextension_threshold should not exceed exit_overextension_threshold")
 
     weights = _empty_weight_frame(momentum.index, momentum.columns)
     held: set[str] = set()

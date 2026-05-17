@@ -30,3 +30,5 @@ logs/
 
 # Private parameter overrides
 config_private.py
+
+*.csv
